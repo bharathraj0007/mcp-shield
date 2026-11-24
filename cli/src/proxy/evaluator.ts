@@ -2,6 +2,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import * as fs from "node:fs";
 import * as crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
 import type {
   JsonRpcRequest,
   ProxyDecision,
@@ -35,42 +36,64 @@ const DESTRUCTIVE_COMMAND_PATTERNS: readonly { readonly regex: RegExp; readonly 
 
 /**
  * Decode URL encodings (%2e, %2f, %5c) and Unicode escape sequences.
+ * Normalizes Unicode via NFKC and removes null bytes.
  */
 export function decodePathEscapes(input: string): string {
+  if (!input) return input;
   let decoded = input;
 
-  // Decode Unicode escape sequences: \u002e, etc.
-  try {
-    decoded = decoded.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) =>
-      String.fromCharCode(parseInt(hex, 16))
-    );
-  } catch {}
-
-  // Repeated URL decoding to defeat multi-layered percent encoding
-  for (let i = 0; i < 3; i++) {
+  // 1. Decode Unicode escape sequences if \u is present
+  if (decoded.includes("\\u")) {
     try {
-      const next = decodeURIComponent(decoded);
-      if (next === decoded) break;
-      decoded = next;
-    } catch {
-      break;
-    }
+      decoded = decoded.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) =>
+        String.fromCharCode(parseInt(hex, 16))
+      );
+    } catch {}
   }
 
-  // Handle explicit percent replacements if any remain
-  decoded = decoded
-    .replace(/%2e/gi, ".")
-    .replace(/%2f/gi, "/")
-    .replace(/%5c/gi, "\\");
+  // 2. Decode percent encoding if % is present
+  if (decoded.includes("%")) {
+    for (let i = 0; i < 3; i++) {
+      try {
+        const next = decodeURIComponent(decoded);
+        if (next === decoded) break;
+        decoded = next;
+      } catch {
+        break;
+      }
+    }
+
+    decoded = decoded
+      .replace(/%2e/gi, ".")
+      .replace(/%2f/gi, "/")
+      .replace(/%5c/gi, "\\");
+  }
+
+  // 3. Normalize Unicode (NFKC) if non-ASCII characters exist
+  if (/[^\x00-\x7F]/.test(decoded)) {
+    try {
+      decoded = decoded.normalize("NFKC");
+    } catch {}
+  }
+
+  // 4. Strip null bytes (\0) to defeat null-byte poisoning
+  if (decoded.includes("\0")) {
+    decoded = decoded.replace(/\0/g, "");
+  }
 
   return decoded;
 }
 
 /**
- * Check for Windows UNC paths (\\server\share or //server/share).
+ * Check for Windows UNC paths (\\server\share, //server/share, \\?\UNC\...).
  */
 export function isUncPath(p: string): boolean {
-  return /^[\\/]{2}[^\\/]+[\\/]+[^\\/]+/.test(p.trim());
+  const trimmed = p.trim();
+  return (
+    /^[\\/]{2}[^\\/]+[\\/]+[^\\/]+/i.test(trimmed) ||
+    /^[\\/]{2}\?[\\/]/i.test(trimmed) ||
+    /^[\\/]{2}\.[\\/]/i.test(trimmed)
+  );
 }
 
 /**
@@ -83,38 +106,69 @@ export function expandHome(p: string): string {
   return p;
 }
 
+const REALPATH_CACHE_LIMIT = 500;
+const realpathCache = new Map<string, string>();
+
 /**
  * Resolve canonical real path on disk, resolving symlinks to prevent escapes.
+ * Uses an in-memory cache to maintain sub-5ms latency under heavy I/O contention.
  */
 export function resolveCanonicalPath(rawPath: string): string {
-  const decoded = decodePathEscapes(rawPath);
+  let decoded = decodePathEscapes(rawPath);
+
+  // If path is a file:// URI, convert or strip
+  if (decoded.startsWith("file://")) {
+    try {
+      decoded = fileURLToPath(decoded);
+    } catch {
+      decoded = decoded.replace(/^file:\/\/[a-zA-Z0-9_\-.]*/i, "");
+    }
+  }
+
   const expanded = expandHome(decoded);
   const absolute = path.resolve(process.cwd(), expanded);
+
+  const cached = realpathCache.get(absolute);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  let resolved = absolute;
 
   // If path exists on disk, resolve its real symlink target
   if (fs.existsSync(absolute)) {
     try {
-      return fs.realpathSync(absolute);
-    } catch {}
-  }
-
-  // If file does not exist, resolve realpath of nearest parent directory
-  let current = absolute;
-  const childSegments: string[] = [];
-
-  while (current && current !== path.dirname(current)) {
-    if (fs.existsSync(current)) {
-      try {
-        const realParent = fs.realpathSync(current);
-        return path.join(realParent, ...childSegments.reverse());
-      } catch {}
-      break;
+      resolved = fs.realpathSync(absolute);
+    } catch {
+      resolved = absolute;
     }
-    childSegments.push(path.basename(current));
-    current = path.dirname(current);
+  } else {
+    // If file does not exist, resolve realpath of nearest parent directory
+    let current = absolute;
+    const childSegments: string[] = [];
+
+    while (current && current !== path.dirname(current)) {
+      if (fs.existsSync(current)) {
+        try {
+          const realParent = fs.realpathSync(current);
+          resolved = path.join(realParent, ...[...childSegments].reverse());
+        } catch {
+          resolved = absolute;
+        }
+        break;
+      }
+      childSegments.push(path.basename(current));
+      current = path.dirname(current);
+    }
   }
 
-  return absolute;
+  if (realpathCache.size >= REALPATH_CACHE_LIMIT) {
+    const firstKey = realpathCache.keys().next().value;
+    if (firstKey) realpathCache.delete(firstKey);
+  }
+  realpathCache.set(absolute, resolved);
+
+  return resolved;
 }
 
 /**
@@ -280,7 +334,7 @@ export function evaluateRequest(
   const structured = extractStructuredArguments(request);
 
   // 1. Inspect Shell Commands
-  const allCommands = [...structured.commands, ...structured.rawStrings];
+  const allCommands = Array.from(new Set([...structured.commands, ...structured.rawStrings]));
   for (const rawCmd of allCommands) {
     const trimmed = rawCmd.trim();
     if (!trimmed) continue;
@@ -313,7 +367,7 @@ export function evaluateRequest(
   }
 
   // 2. Inspect File Paths
-  const allCandidatePaths = [...structured.paths, ...structured.rawStrings];
+  const allCandidatePaths = Array.from(new Set([...structured.paths, ...structured.rawStrings]));
   for (const rawPath of allCandidatePaths) {
     const trimmed = rawPath.trim();
     if (!trimmed) continue;

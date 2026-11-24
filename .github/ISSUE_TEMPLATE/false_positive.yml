@@ -1,0 +1,48 @@
+name: False Positive Report
+description: Report a legitimate file or safe command that mcp-shield incorrectly flagged or blocked
+title: "[FALSE POSITIVE]: "
+labels: ["false-positive", "rules"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template when mcp-shield flags a legitimate file or blocks a safe developer action.
+  - type: dropdown
+    id: rule-id
+    attributes:
+      label: Triggered Rule ID
+      description: Which rule was incorrectly triggered?
+      options:
+        - "MS-001 (Token Mismanagement / Secrets)"
+        - "MS-002 (Privilege Escalation / Path Exposure)"
+        - "MS-003 (Tool Poisoning / Prompt Injection)"
+        - "MS-004 (Supply Chain Tampering / Unpinned Packages)"
+        - "MS-005 (Command Injection / Destructive Commands)"
+        - "MS-006 (Insecure Transport / HTTP)"
+        - "MS-007 (Shadow MCP Servers)"
+        - "Other / Custom Policy"
+    validations:
+      required: true
+  - type: input
+    id: tool-or-path
+    attributes:
+      label: Target Path, Command, or Value
+      description: What was the exact string or path flagged? (Redact any real keys).
+      placeholder: "./src/environment-config.ts"
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context & Justification
+      description: Why is this command or path safe in your environment?
+    validations:
+      required: true
+  - type: textarea
+    id: sample-config
+    attributes:
+      label: Sample Configuration Snippet
+      description: Provide a sanitized snippet of the configuration that caused the finding.
+      render: json
+    validations:
+      required: true

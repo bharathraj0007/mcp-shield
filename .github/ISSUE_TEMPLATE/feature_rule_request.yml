@@ -1,0 +1,44 @@
+name: New Rule or Feature Request
+description: Propose a new OWASP MCP rule (MS-008+) or CLI capability
+title: "[PROPOSAL]: "
+labels: ["enhancement", "rules"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Propose a new deterministic security rule or CLI capability for mcp-shield.
+  - type: input
+    id: title
+    attributes:
+      label: Feature or Rule Title
+      placeholder: "MS-008: Sensitive Registry File Inspection"
+    validations:
+      required: true
+  - type: input
+    id: owasp-category
+    attributes:
+      label: Target OWASP MCP Category
+      placeholder: "MCP06:2025 Context Manipulation"
+    validations:
+      required: false
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem & Threat Vector
+      description: What threat does this rule or feature address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Proposed Implementation
+      description: Describe the detection logic, pattern regex, or CLI subcommand.
+    validations:
+      required: true
+  - type: textarea
+    id: test-examples
+    attributes:
+      label: Example Test Cases
+      description: Provide at least one positive (attack) and one negative (benign) example.
+    validations:
+      required: true

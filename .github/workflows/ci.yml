@@ -29,7 +29,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: cli
-        run: npm ci
+        run: npm install
 
       - name: Type check and build
         working-directory: cli
@@ -39,6 +39,21 @@ jobs:
         working-directory: cli
         run: npm test
 
+      - name: Run latency and corpus benchmarks
+        working-directory: cli
+        run: npm run bench
+
       - name: Run black-box self-test
         working-directory: cli
         run: npm run self-test
+
+      - name: Generate SARIF Security Report
+        if: matrix.os == 'ubuntu-latest' && matrix.node-version == 20
+        working-directory: cli
+        run: node dist/index.js scan . --format sarif > ../mcp-shield.sarif
+
+      - name: Upload SARIF report
+        if: matrix.os == 'ubuntu-latest' && matrix.node-version == 20
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: mcp-shield.sarif

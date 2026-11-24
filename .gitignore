@@ -26,11 +26,13 @@ audit.jsonl
 # Documentation binaries & exports
 *.pdf
 
-# Internal agent workflows & Markdown docs (publish README.md only)
+# Internal agent control contracts & progress trackers
+AGENTS.md
+AGENTS.MD
+PROGRESS.md
+TESTING.md
+TESTING.MD
 .agents/
-*.md
-*.MD
-!README.md
 
 # Operating system files
 .DS_Store

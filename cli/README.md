@@ -1,5 +1,11 @@
 # mcp-shield
 
+[![CI](https://github.com/bharathraj0007/mcp-shield/actions/workflows/ci.yml/badge.svg)](https://github.com/bharathraj0007/mcp-shield/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/@bharathraj0007/mcp-shield.svg)](https://www.npmjs.com/package/@bharathraj0007/mcp-shield)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D20.0.0-green.svg)](https://nodejs.org)
+[![Telemetry](https://img.shields.io/badge/telemetry-zero%20(100%25%20offline)-success.svg)](SECURITY.md)
+
 > 100% Offline Local Security Scanner, Runtime Firewall, and Policy Engine for AI Coding Agents.
 
 `mcp-shield` reduces risk for developer machines running AI coding agents. It detects hardcoded secrets, blocks path traversal attacks, and enforces security policies across local Model Context Protocol (MCP) servers.
@@ -17,10 +23,13 @@ The tool operates **100% offline**. It sends no data over the network and collec
 
 ```bash
 # Option A: Install globally from npm
-npm install -g mcp-shield
+npm install -g @bharathraj0007/mcp-shield
 
-# Option B: Build from source (100% offline)
-git clone https://github.com/<your-username>/mcp-shield.git
+# Option B: Run directly via npx
+npx @bharathraj0007/mcp-shield scan
+
+# Option C: Build from source (100% offline)
+git clone https://github.com/bharathraj0007/mcp-shield.git
 cd mcp-shield/cli
 npm install
 npm run build
@@ -94,7 +103,26 @@ Add `mcp-shield` as a proxy wrapper inside your client configuration (`mcp.json`
 
 ---
 
-## 3. CLI Command Reference
+## 3. Threat Model Summary
+
+`mcp-shield` provides deterministic protection boundaries across the local machine:
+
+### Covered Threat Vectors
+- **Path Traversal & Symlink Escapes:** Normalizes URL-encoded sequences (`%2e%2e`), Unicode escapes, and Windows UNC paths (`\\server\share`). Resolves canonical symlinks (`fs.realpathSync`) to prevent workspace escapes.
+- **Destructive Command Execution:** Tokenizes and blocks shell injection patterns (`rm -rf`, `curl | sh`, `chmod 777`, encoded PowerShell).
+- **Hardcoded Secret Leakage:** Detects API keys across 9 MCP client configurations and automatically extracts them into isolated `.env.mcp` files.
+- **Mid-Session Rug-Pull Mutations:** Computes SHA-256 hashes of `tools/list` schemas upon connection and blocks subsequent calls if tool definitions mutate mid-session.
+- **Audit Log Tampering:** Links all security events via SHA-256 hash chains with monotonic sequence numbers, detecting modification and truncation.
+
+### Out of Scope
+- Compromised host operating system kernel or administrator/root malware.
+- Attacks occurring across external network sockets outside the MCP `stdio` channel.
+
+For detailed security architecture, see [THREAT_MODEL.md](../THREAT_MODEL.md) and [SECURITY.md](../SECURITY.md).
+
+---
+
+## 4. CLI Command Reference
 
 ### `mcp-shield scan [path] [options]`
 Scans discovered or specified configuration files for security vulnerabilities.
@@ -152,7 +180,7 @@ mcp-shield audit --verify
 
 ---
 
-## 4. OWASP MCP Top 10 Rule Coverage
+## 5. OWASP MCP Top 10 Rule Coverage
 
 | Rule ID | OWASP Category | Severity | Detection Summary |
 | :--- | :--- | :--- | :--- |
@@ -166,7 +194,7 @@ mcp-shield audit --verify
 
 ---
 
-## 5. GitHub Actions SARIF Integration
+## 6. GitHub Actions SARIF Integration
 
 Add this step to your GitHub Actions workflow to publish findings to GitHub Code Scanning:
 
@@ -189,7 +217,7 @@ jobs:
           node-version: 20
 
       - name: Run mcp-shield Scan
-        run: npx mcp-shield scan . --format sarif > mcp-shield.sarif
+        run: npx @bharathraj0007/mcp-shield scan . --format sarif > mcp-shield.sarif
 
       - name: Upload SARIF report
         uses: github/codeql-action/upload-sarif@v3
@@ -199,26 +227,33 @@ jobs:
 
 ---
 
-## 6. Benchmarks & Detection Coverage
+## 7. Benchmarks & Detection Coverage
 
 `mcp-shield` passes an automated test suite with a 104-case security corpus:
 - **Detection Rate:** 100% on malicious fixtures (path traversal, symlink escapes, UNC paths, command injection, secret leakage, rug-pull tool mutations).
 - **False-Positive Rate:** 0% on standard workspace reads and benign configurations.
 - **Latency Overhead:** < 5 ms p99 per JSON-RPC frame (measured across 500 messages).
 
+To reproduce benchmarks locally:
+```bash
+cd cli
+npm run bench
+```
+
 The tool performs all inspections locally and operates 100% offline.
 
 ---
 
-## 7. Security & Offline Guarantee
+## 8. Open Source Governance
 
-- **Zero Outbound Calls:** `mcp-shield` contains zero network dependencies. It runs cleanly in Airplane Mode.
-- **Zero Raw Secret Leaks:** Every detected key is masked (example: `sk-proj-***...9a2f`) before printing or logging.
-- **Backup Before Edit:** `mcp-shield fix` creates a timestamped `.bak` backup copy before modifying any file.
-- **Tamper Evidence:** Every scan and proxy event links to the previous entry via SHA-256 hash chaining.
+- **Threat Model:** [THREAT_MODEL.md](../THREAT_MODEL.md)
+- **Security Policy:** [SECURITY.md](../SECURITY.md)
+- **Contribution Guide:** [CONTRIBUTING.md](../CONTRIBUTING.md)
+- **Changelog:** [CHANGELOG.md](../CHANGELOG.md)
+- **Terminal Demo Script:** [demo.tape](../demo.tape)
 
 ---
 
-## 8. License
+## 9. License
 
 Apache-2.0

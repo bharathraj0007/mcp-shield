@@ -1,10 +1,73 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import * as readline from "node:readline";
 import pc from "picocolors";
 import type { JsonRpcRequest, JsonRpcResponse, PolicyConfig } from "../types/index.js";
 import { evaluateRequest, defaultRugPullDetector, type ToolDefinition } from "./evaluator.js";
 
 export const MAX_FRAME_SIZE = 1024 * 1024; // 1 MB limit
+
+/**
+ * LineBuffer buffers raw binary chunks across data events and extracts complete lines.
+ * Enforces MAX_FRAME_SIZE to prevent buffer exhaustion and memory denial of service.
+ */
+export class LineBuffer {
+  private buffer: Buffer = Buffer.alloc(0);
+  private readonly maxFrameSize: number;
+
+  constructor(maxFrameSize: number = MAX_FRAME_SIZE) {
+    this.maxFrameSize = maxFrameSize;
+  }
+
+  public push(
+    chunk: Buffer,
+    onLine: (line: string) => void,
+    onOversized: (size: number) => void
+  ): void {
+    this.buffer = Buffer.concat([this.buffer, chunk]);
+
+    let newlineIndex: number;
+    while ((newlineIndex = this.buffer.indexOf(0x0a)) !== -1) {
+      if (newlineIndex > this.maxFrameSize) {
+        onOversized(newlineIndex);
+        this.buffer = this.buffer.subarray(newlineIndex + 1);
+        continue;
+      }
+
+      let lineBuffer = this.buffer.subarray(0, newlineIndex);
+      // Strip trailing \r if present
+      if (lineBuffer.length > 0 && lineBuffer[lineBuffer.length - 1] === 0x0d) {
+        lineBuffer = lineBuffer.subarray(0, lineBuffer.length - 1);
+      }
+
+      const line = lineBuffer.toString("utf-8");
+      this.buffer = this.buffer.subarray(newlineIndex + 1);
+      onLine(line);
+    }
+
+    // Fail-closed immediately if un-terminated buffer exceeds max frame size
+    if (this.buffer.length > this.maxFrameSize) {
+      onOversized(this.buffer.length);
+      this.buffer = Buffer.alloc(0);
+    }
+  }
+
+  public flush(onLine: (line: string) => void): void {
+    if (this.buffer.length > 0) {
+      let lineBuffer = this.buffer;
+      if (lineBuffer.length > 0 && lineBuffer[lineBuffer.length - 1] === 0x0d) {
+        lineBuffer = lineBuffer.subarray(0, lineBuffer.length - 1);
+      }
+      const line = lineBuffer.toString("utf-8");
+      this.buffer = Buffer.alloc(0);
+      if (line.trim().length > 0) {
+        onLine(line);
+      }
+    }
+  }
+
+  public getBufferedLength(): number {
+    return this.buffer.length;
+  }
+}
 
 export interface ProxyOptions {
   readonly command: string;
@@ -46,13 +109,9 @@ export function startStdioProxy(options: ProxyOptions): Promise<number> {
 
     const mutatedToolsSet = new Set<string>();
 
-    // Forward child stdout line-by-line to host stdout and inspect for tools/list responses
-    const childOutRl = readline.createInterface({
-      input: child.stdout,
-      terminal: false,
-    });
+    const childOutBuffer = new LineBuffer(MAX_FRAME_SIZE);
 
-    childOutRl.on("line", (line: string) => {
+    const handleChildStdoutLine = (line: string) => {
       const trimmed = line.trim();
       if (!trimmed) return;
 
@@ -70,47 +129,64 @@ export function startStdioProxy(options: ProxyOptions): Promise<number> {
           }
         }
       } catch {
-        // Continue forwarding
+        // Forward non-JSON or other responses normally
       }
 
       process.stdout.write(line + "\n");
+    };
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      childOutBuffer.push(
+        chunk,
+        handleChildStdoutLine,
+        (size: number) => {
+          process.stderr.write(
+            `${pc.bgRed(pc.white(" MCP-SHIELD "))} Child stdout frame exceeded 1 MB limit (${size} bytes).\n`
+          );
+        }
+      );
     });
 
-    // Intercept host stdin line-by-line
-    const stdinRl = readline.createInterface({
-      input: process.stdin,
-      terminal: false,
+    child.stdout.on("end", () => {
+      childOutBuffer.flush(handleChildStdoutLine);
     });
 
-    stdinRl.on("line", (line: string) => {
-      const trimmed = line.trim();
-      if (!trimmed) return;
+    const stdinBuffer = new LineBuffer(MAX_FRAME_SIZE);
 
-      // 1. Frame Size Enforcement (1 MB max) -> Fail Closed
-      if (Buffer.byteLength(line, "utf-8") > MAX_FRAME_SIZE) {
-        process.stderr.write(
-          `${pc.bgRed(pc.white(" MCP-SHIELD FAIL-CLOSED "))} Frame exceeded maximum 1 MB limit (${line.length} bytes). Dropping payload.\n`
-        );
+    const handleOversizedStdin = (size: number, rawSnippet?: string) => {
+      process.stderr.write(
+        `${pc.bgRed(pc.white(" MCP-SHIELD FAIL-CLOSED "))} Frame exceeded maximum 1 MB limit (${size} bytes). Dropping payload.\n`
+      );
 
-        // Attempt to extract an id if possible, otherwise null
-        let extractedId: string | number | null = null;
-        const idMatch = /"id"\s*:\s*(\d+|"[^"]+")/.exec(line.slice(0, 500));
+      let extractedId: string | number | null = null;
+      if (rawSnippet) {
+        const idMatch = /"id"\s*:\s*(\d+|"[^"]+")/.exec(rawSnippet.slice(0, 500));
         if (idMatch && idMatch[1]) {
           try {
             extractedId = JSON.parse(idMatch[1]);
           } catch {}
         }
+      }
 
-        const oversizedError: JsonRpcResponse = {
-          jsonrpc: "2.0",
-          id: extractedId,
-          error: {
-            code: -32001,
-            message: "Blocked by mcp-shield: Frame size exceeds maximum allowed 1 MB limit",
-            data: { action: "BLOCK", reason: "OVERSIZED_FRAME" },
-          },
-        };
-        process.stdout.write(JSON.stringify(oversizedError) + "\n");
+      const oversizedError: JsonRpcResponse = {
+        jsonrpc: "2.0",
+        id: extractedId,
+        error: {
+          code: -32001,
+          message: "Blocked by mcp-shield: Frame size exceeds maximum allowed 1 MB limit",
+          data: { action: "BLOCK", reason: "OVERSIZED_FRAME" },
+        },
+      };
+      process.stdout.write(JSON.stringify(oversizedError) + "\n");
+    };
+
+    const handleStdinLine = (line: string) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+
+      // 1. Frame Size Enforcement (1 MB max) -> Fail Closed
+      if (Buffer.byteLength(line, "utf-8") > MAX_FRAME_SIZE) {
+        handleOversizedStdin(Buffer.byteLength(line, "utf-8"), line);
         return;
       }
 
@@ -231,17 +307,26 @@ export function startStdioProxy(options: ProxyOptions): Promise<number> {
           process.stdout.write(JSON.stringify(errorResponse) + "\n");
         }
       }
+    };
+
+    process.stdin.on("data", (chunk: Buffer) => {
+      stdinBuffer.push(
+        chunk,
+        handleStdinLine,
+        (size: number) => handleOversizedStdin(size)
+      );
     });
 
-    stdinRl.on("close", () => {
+    process.stdin.on("end", () => {
+      stdinBuffer.flush(handleStdinLine);
       if (child.stdin && !child.stdin.destroyed) {
         child.stdin.end();
       }
     });
 
     const cleanup = () => {
-      stdinRl.close();
-      childOutRl.close();
+      process.stdin.removeAllListeners("data");
+      process.stdin.removeAllListeners("end");
     };
 
     child.on("error", (err) => {
