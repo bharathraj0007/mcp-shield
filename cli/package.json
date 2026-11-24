@@ -4,7 +4,7 @@
   "description": "100% offline local AI agent security scanner, runtime firewall, and YAML policy engine",
   "type": "module",
   "bin": {
-    "mcp-shield": "./dist/index.js"
+    "mcp-shield": "dist/index.js"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
