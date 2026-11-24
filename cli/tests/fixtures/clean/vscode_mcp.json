@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "vscode-safe-server": {
+      "command": "node",
+      "args": ["./src/index.js", "./project-data"],
+      "env": {
+        "DEBUG": "false"
+      }
+    }
+  }
+}

@@ -1,0 +1,23 @@
+// Clean MCP configuration fixture for mcp-shield tests
+{
+  "mcpServers": {
+    "safe-local-server": {
+      "command": "node",
+      "args": ["./dist/server.js", "--scope", "./docs"],
+      "env": {
+        "API_KEY": "${SAFE_ENV_KEY}",
+        "NODE_ENV": "production",
+      },
+    },
+    "safe-pinned-tool": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem@1.2.0", "./workspace"],
+    },
+    "safe-remote-server": {
+      "url": "https://api.example.com/mcp",
+    },
+    "safe-localhost-server": {
+      "url": "http://localhost:3000/sse",
+    },
+  },
+}

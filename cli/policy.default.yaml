@@ -1,0 +1,19 @@
+version: "1.0"
+mode: "enforce" # "enforce" | "monitor"
+denyPaths:
+  - "**/.env"
+  - "**/.env.*"
+  - "~/.ssh/**"
+  - "~/.aws/**"
+  - "~/.gnupg/**"
+  - "/etc/passwd"
+allowPaths:
+  - "./src/**"
+blockedCommands:
+  - "rm -rf"
+  - "curl * | sh"
+  - "wget * | bash"
+  - "chmod 777"
+disabledRules: []
+allowedServers: [] # Optional allowlist for MS-007 Shadow MCP detection
+failOnSeverity: "high" # "critical" | "high" | "medium" | "low"

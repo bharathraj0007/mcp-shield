@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }} (Node ${{ matrix.node-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node-version: [20, 22]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: "npm"
+          cache-dependency-path: cli/package.json
+
+      - name: Install dependencies
+        working-directory: cli
+        run: npm ci
+
+      - name: Type check and build
+        working-directory: cli
+        run: npm run build
+
+      - name: Run unit and integration tests
+        working-directory: cli
+        run: npm test
+
+      - name: Run black-box self-test
+        working-directory: cli
+        run: npm run self-test

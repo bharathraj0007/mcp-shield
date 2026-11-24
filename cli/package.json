@@ -1,0 +1,46 @@
+{
+  "name": "mcp-shield",
+  "version": "1.0.0",
+  "description": "100% offline local AI agent security scanner, runtime firewall, and YAML policy engine",
+  "type": "module",
+  "bin": {
+    "mcp-shield": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "policy.default.yaml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "self-test": "npm run build && node scripts/agent-self-test.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "security",
+    "firewall",
+    "scanner",
+    "ai-agent",
+    "offline"
+  ],
+  "license": "Apache-2.0",
+  "dependencies": {
+    "commander": "^13.1.0",
+    "jsonc-parser": "^3.3.1",
+    "picocolors": "^1.1.1",
+    "yaml": "^2.7.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "tsup": "^8.4.0",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.7"
+  }
+}

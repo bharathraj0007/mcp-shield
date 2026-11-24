@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build artifacts
+dist/
+build/
+*.tsbuildinfo
+
+# Sensitive files & local secret extractions
+.env
+.env.local
+.env.mcp
+*.pem
+*.key
+
+# Backups
+*.bak
+*.bak.*
+
+# Audit logs & runtime databases
+.mcp-shield/
+audit.jsonl
+*.log
+
+# Documentation binaries & exports
+*.pdf
+
+# Internal agent workflows & Markdown docs (publish README.md only)
+.agents/
+*.md
+*.MD
+!README.md
+
+# Operating system files
+.DS_Store
+Thumbs.db
