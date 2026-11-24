@@ -7,7 +7,6 @@ import {
   validatePolicyFile,
   getPolicyJsonSchema,
   getStarterPolicyContent,
-  PolicySchema,
 } from "../src/policy/loader.js";
 import { parseConfigFile, expandEnvVars, parseSimpleToml } from "../src/scanner/discover.js";
 import { checkUnpinnedPackage, RULE_DEFINITIONS } from "../src/scanner/rules.js";
@@ -17,15 +16,17 @@ import * as mcpShieldLib from "../src/index.js";
 import type { NormalizedMcpServer, ScanFinding } from "../src/types/index.js";
 
 describe("Phase 3: Zod Schema, Format Maturity & Programmatic API", () => {
-  const tempDir = path.join(os.tmpdir(), `mcp-shield-p3-test-${Date.now()}`);
+  let tempDir: string;
 
   beforeAll(() => {
-    fs.mkdirSync(tempDir, { recursive: true });
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-shield-p3-"));
   });
 
   afterAll(() => {
     try {
-      fs.rmSync(tempDir, { recursive: true, force: true });
+      if (tempDir) {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
     } catch {}
   });
 

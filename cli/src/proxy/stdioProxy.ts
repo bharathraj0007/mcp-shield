@@ -12,7 +12,6 @@ import {
   validateJsonRpcPayload,
   createJsonRpcError,
   extractIdSafely,
-  type ValidationFailure,
 } from "./jsonValidator.js";
 import { evaluateRequest } from "./evaluator.js";
 import { RugPullManager, type ToolDefinition } from "./rugpull.js";

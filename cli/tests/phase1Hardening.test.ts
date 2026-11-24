@@ -5,7 +5,6 @@ import * as os from "node:os";
 import { executeSafeFix, executeRollback } from "../src/policy/fixer.js";
 import {
   checkSecretLeak,
-  computeFindingFingerprint,
   isSafePlaceholder,
 } from "../src/scanner/rules.js";
 import {
@@ -160,7 +159,7 @@ describe("Phase 1 Hardening Test Suite (mcp-shield v0.2.0)", () => {
       try {
         fs.symlinkSync(realConfig, symlinkConfig);
         expect(() => executeSafeFix({ targetPath: symlinkConfig })).toThrow(/symbolic link/i);
-      } catch (err) {
+      } catch {
         // Skip symlink test if OS lacks permissions (e.g. unprivileged Windows)
       }
     });

@@ -97,30 +97,34 @@ export function appendAuditEntry(
   const dir = path.dirname(logPath);
 
   // 1. Check directory symlink & create directory safely
-  if (fs.existsSync(dir)) {
+  fs.mkdirSync(dir, {
+    recursive: true,
+    mode: process.platform === "win32" ? undefined : 0o700,
+  });
+  try {
     const dStat = fs.lstatSync(dir);
     if (dStat.isSymbolicLink()) {
       throw new Error("SYMLINK_DETECTED: Audit directory cannot be a symbolic link");
     }
-  } else {
-    fs.mkdirSync(dir, {
-      recursive: true,
-      mode: process.platform === "win32" ? undefined : 0o700,
-    });
+  } catch (err) {
+    if ((err as Error).message.startsWith("SYMLINK_DETECTED")) throw err;
   }
 
   // 2. Check file symlink
-  if (fs.existsSync(logPath)) {
+  try {
     const fStat = fs.lstatSync(logPath);
     if (fStat.isSymbolicLink()) {
       throw new Error("SYMLINK_DETECTED: Audit log file cannot be a symbolic link");
     }
+  } catch (err) {
+    if ((err as Error).message.startsWith("SYMLINK_DETECTED")) throw err;
+    // File does not exist yet, which is safe
   }
 
   let prevHash = GENESIS_PREV_HASH;
   let seq = 1;
 
-  if (fs.existsSync(logPath)) {
+  try {
     const lines = fs
       .readFileSync(logPath, "utf-8")
       .trim()
@@ -144,6 +148,11 @@ export function appendAuditEntry(
           // Fall back to genesis if last line was corrupt
         }
       }
+    }
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "EPERM" && code !== "EACCES") {
+      throw err;
     }
   }
 
@@ -207,45 +216,53 @@ export function verifyAuditLog(
   const dir = path.dirname(logPath);
 
   // Check symlinks
-  if (fs.existsSync(dir)) {
-    try {
-      if (fs.lstatSync(dir).isSymbolicLink()) {
-        return {
-          valid: false,
-          totalEntries: 0,
-          code: "SYMLINK_DETECTED",
-          errorReason: "Audit directory is a symbolic link",
-        };
-      }
-    } catch {}
-  }
-
-  if (fs.existsSync(logPath)) {
-    try {
-      if (fs.lstatSync(logPath).isSymbolicLink()) {
-        return {
-          valid: false,
-          totalEntries: 0,
-          code: "SYMLINK_DETECTED",
-          errorReason: "Audit log file is a symbolic link",
-        };
-      }
-    } catch {}
-  }
-
-  if (!fs.existsSync(logPath)) {
-    if (expectedTotalRecords && expectedTotalRecords > 0) {
+  try {
+    if (fs.lstatSync(dir).isSymbolicLink()) {
       return {
         valid: false,
         totalEntries: 0,
-        code: "MISSING_LOG",
-        errorReason: `Audit log file is missing; expected ${expectedTotalRecords} records`,
+        code: "SYMLINK_DETECTED",
+        errorReason: "Audit directory is a symbolic link",
       };
     }
-    return { valid: true, totalEntries: 0, code: "SUCCESS" };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "EPERM" && code !== "EACCES") throw err;
   }
 
-  const content = fs.readFileSync(logPath, "utf-8");
+  try {
+    if (fs.lstatSync(logPath).isSymbolicLink()) {
+      return {
+        valid: false,
+        totalEntries: 0,
+        code: "SYMLINK_DETECTED",
+        errorReason: "Audit log file is a symbolic link",
+      };
+    }
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "EPERM" && code !== "EACCES") throw err;
+  }
+
+  let content: string;
+  try {
+    content = fs.readFileSync(logPath, "utf-8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "EPERM" || code === "EACCES") {
+      if (expectedTotalRecords && expectedTotalRecords > 0) {
+        return {
+          valid: false,
+          totalEntries: 0,
+          code: "MISSING_LOG",
+          errorReason: `Audit log file is missing; expected ${expectedTotalRecords} records`,
+        };
+      }
+      return { valid: true, totalEntries: 0, code: "SUCCESS" };
+    }
+    throw err;
+  }
+
   const lines = content.split("\n").filter((l) => l.trim().length > 0);
 
   if (lines.length === 0) {
@@ -383,9 +400,13 @@ export function exportAuditLog(
 
 export function getAuditTail(n: number = 20, customLogPath?: string): AuditLogEntry[] {
   const logPath = customLogPath || getDefaultAuditLogPath();
-  if (!fs.existsSync(logPath)) return [];
+  let content: string;
+  try {
+    content = fs.readFileSync(logPath, "utf-8");
+  } catch {
+    return [];
+  }
 
-  const content = fs.readFileSync(logPath, "utf-8");
   const lines = content.split("\n").filter((l) => l.trim().length > 0);
   const selected = lines.slice(-n);
   const entries: AuditLogEntry[] = [];

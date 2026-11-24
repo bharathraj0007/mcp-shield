@@ -121,21 +121,35 @@ function formatEnvValue(val: string): string {
 
 export function executeRollback(backupPath: string): FixResult {
   const resolvedBackup = path.resolve(backupPath);
-  if (!fs.existsSync(resolvedBackup)) {
+  let backupContent: string;
+  try {
+    const bStat = fs.lstatSync(resolvedBackup);
+    if (bStat.isSymbolicLink()) {
+      throw new Error(`Refusing to restore from symbolic link: ${backupPath}`);
+    }
+    backupContent = fs.readFileSync(resolvedBackup, "utf-8");
+  } catch (err: unknown) {
+    if ((err as Error).message.includes("symbolic link")) throw err;
     throw new Error(`Backup file not found: ${backupPath}`);
   }
 
   let targetConfig = resolvedBackup;
   if (resolvedBackup.endsWith(".bak")) {
-    targetConfig = resolvedBackup.slice(0, -4);
-    // Handle timestamped pattern: file.json.2026-11-25T...bak
-    const match = /(.*)\.\d{4}-\d{2}-\d{2}T[^\.]+\.bak$/.exec(resolvedBackup);
-    if (match && match[1]) {
-      targetConfig = match[1];
+    const withoutBak = resolvedBackup.slice(0, -4);
+    const lastDot = withoutBak.lastIndexOf(".");
+    if (lastDot !== -1) {
+      const suffix = withoutBak.slice(lastDot + 1);
+      // Bounded linear-time pattern without leading wildcard backtracking
+      if (/^\d{4}-\d{2}-\d{2}T[0-9a-zA-Z_\-]+$/.test(suffix)) {
+        targetConfig = withoutBak.slice(0, lastDot);
+      } else {
+        targetConfig = withoutBak;
+      }
+    } else {
+      targetConfig = withoutBak;
     }
   }
 
-  const backupContent = fs.readFileSync(resolvedBackup, "utf-8");
   fs.writeFileSync(targetConfig, backupContent, "utf-8");
 
   // Check if matching .env.mcp backup exists
@@ -185,17 +199,18 @@ export function executeSafeFix(
   }
 
   const resolvedPath = path.resolve(options.targetPath);
-  if (!fs.existsSync(resolvedPath)) {
+  let rawContent: string;
+  try {
+    const lstat = fs.lstatSync(resolvedPath);
+    if (lstat.isSymbolicLink()) {
+      throw new Error(`Refusing to modify symbolic link: ${resolvedPath}`);
+    }
+    rawContent = fs.readFileSync(resolvedPath, "utf-8");
+  } catch (err: unknown) {
+    if ((err as Error).message.includes("symbolic link")) throw err;
     throw new Error(`Target configuration file not found: ${options.targetPath}`);
   }
 
-  // Refuse symlinks
-  const lstat = fs.lstatSync(resolvedPath);
-  if (lstat.isSymbolicLink()) {
-    throw new Error(`Refusing to modify symbolic link: ${resolvedPath}`);
-  }
-
-  const rawContent = fs.readFileSync(resolvedPath, "utf-8");
   const rootNode = parseTree(rawContent, undefined, { allowTrailingComma: true });
 
   if (!rootNode || rootNode.type !== "object") {
@@ -229,14 +244,18 @@ export function executeSafeFix(
   // Read existing .env.mcp if present
   let existingEnvContent = "";
   let existingKeyMap = new Map<string, string>();
-  if (fs.existsSync(envFile)) {
-    // Check symlink on env file
-    if (fs.lstatSync(envFile).isSymbolicLink()) {
+  try {
+    const envLstat = fs.lstatSync(envFile);
+    if (envLstat.isSymbolicLink()) {
       throw new Error(`Refusing to write to symbolic link env file: ${envFile}`);
     }
     existingEnvContent = fs.readFileSync(envFile, "utf-8");
     const parsedEnv = parseEnvFile(existingEnvContent);
     existingKeyMap = parsedEnv.keyMap;
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw err;
+    }
   }
 
   const plannedExtractions: FixPlanItem[] = [];

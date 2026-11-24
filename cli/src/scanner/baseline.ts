@@ -9,9 +9,6 @@ import type { BaselineFile, BaselineFinding, ScanFinding } from "../types/index.
 export function loadBaseline(filePath: string): BaselineFile | undefined {
   try {
     const resolvedPath = path.resolve(filePath);
-    if (!fs.existsSync(resolvedPath)) {
-      return undefined;
-    }
     const content = fs.readFileSync(resolvedPath, "utf-8");
     const parsed = JSON.parse(content) as unknown;
     if (

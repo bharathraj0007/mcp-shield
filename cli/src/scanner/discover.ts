@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { parse as parseJsonc, printParseErrorCode } from "jsonc-parser";
+import { parse as parseJsonc } from "jsonc-parser";
 import { parse as parseYaml } from "yaml";
 import type { NormalizedMcpServer, McpClientType, McpTransportType } from "../types/index.js";
 
@@ -337,12 +337,12 @@ export function parseConfigFile(
   client: McpClientType = "custom"
 ): NormalizedMcpServer[] {
   const resolvedPath = path.resolve(expandHome(filePath));
-  if (!fs.existsSync(resolvedPath)) {
-    return [];
-  }
 
   try {
     const stat = fs.lstatSync(resolvedPath);
+    if (!stat.isFile()) {
+      return [];
+    }
     if (stat.size > 5 * 1024 * 1024) {
       process.stderr.write(`Warning: Config file ${resolvedPath} exceeds 5 MB limit. Skipping.\n`);
       return [];
@@ -471,7 +471,7 @@ export function discoverConfigs(customPath?: string): {
 
   if (customPath) {
     const resolved = path.resolve(expandHome(customPath));
-    if (fs.existsSync(resolved)) {
+    try {
       const stat = fs.statSync(resolved);
       if (stat.isFile()) {
         scannedFiles.add(resolved);
@@ -492,12 +492,13 @@ export function discoverConfigs(customPath?: string): {
         ];
         for (const rel of candidateNames) {
           const target = path.join(resolved, rel);
-          if (fs.existsSync(target) && fs.statSync(target).isFile()) {
-            if (!isBackupFile(target)) {
+          try {
+            const targetStat = fs.statSync(target);
+            if (targetStat.isFile() && !isBackupFile(target)) {
               scannedFiles.add(target);
               servers.push(...parseConfigFile(target, "custom"));
             }
-          }
+          } catch {}
         }
         if (scannedFiles.size === 0) {
           try {
@@ -520,7 +521,7 @@ export function discoverConfigs(customPath?: string): {
           } catch {}
         }
       }
-    }
+    } catch {}
     return { servers, scannedFiles: Array.from(scannedFiles) };
   }
 
@@ -528,9 +529,14 @@ export function discoverConfigs(customPath?: string): {
   for (const loc of getKnownLocations()) {
     try {
       const p = loc.getPath();
-      if (fs.existsSync(p) && !isBackupFile(p)) {
-        scannedFiles.add(p);
-        servers.push(...parseConfigFile(p, loc.client));
+      if (!isBackupFile(p)) {
+        try {
+          const stat = fs.statSync(p);
+          if (stat.isFile()) {
+            scannedFiles.add(p);
+            servers.push(...parseConfigFile(p, loc.client));
+          }
+        } catch {}
       }
     } catch {
       // Skip inaccessible locations cleanly

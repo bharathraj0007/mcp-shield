@@ -24,7 +24,7 @@ import { generateSarifReport } from "./audit/sarif.js";
 import { loadBaseline, filterWithBaseline, updateBaseline } from "./scanner/baseline.js";
 import { RULE_DEFINITIONS } from "./scanner/rules.js";
 import { generateCompletions } from "./completions/index.js";
-import { ExitCode, type RuleSeverity, type ScanResult } from "./types/index.js";
+import { ExitCode, type RuleSeverity, type ScanResult, type BaselineFile } from "./types/index.js";
 
 // Read package version dynamically
 let cliVersion = "0.2.0";
@@ -32,11 +32,9 @@ try {
   const currentFilename = fileURLToPath(import.meta.url);
   const currentDir = path.dirname(currentFilename);
   const pkgPath = path.resolve(currentDir, "../package.json");
-  if (fs.existsSync(pkgPath)) {
-    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8")) as { version?: string };
-    if (pkg.version) {
-      cliVersion = pkg.version;
-    }
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8")) as { version?: string };
+  if (pkg.version) {
+    cliVersion = pkg.version;
   }
 } catch {
   // Fallback to "0.2.0"
@@ -161,9 +159,7 @@ program
         if (effectiveOutput) {
           const outputPath = path.resolve(effectiveOutput);
           const outputDir = path.dirname(outputPath);
-          if (!fs.existsSync(outputDir)) {
-            fs.mkdirSync(outputDir, { recursive: true });
-          }
+          fs.mkdirSync(outputDir, { recursive: true });
           if (format === "terminal") {
             fs.writeFileSync(outputPath, JSON.stringify(finalResult, null, 2) + "\n", "utf-8");
           } else {
@@ -353,18 +349,21 @@ program
   .action((options?: { policy?: string; template?: "default" | "strict" }) => {
     try {
       const targetPolicy = path.resolve(process.cwd(), options?.policy || "policy.yaml");
-      if (fs.existsSync(targetPolicy)) {
-        console.log(pc.yellow(`Policy file already exists at: ${targetPolicy}`));
-        process.exitCode = ExitCode.SUCCESS;
-        return;
-      }
-
       const templateType = options?.template === "strict" ? "strict" : "default";
       const content = getStarterPolicyContent(templateType);
 
-      fs.writeFileSync(targetPolicy, content, "utf-8");
-      console.log(pc.green(`✓ Initialized starter policy (${templateType}) at: ${targetPolicy}`));
-      process.exitCode = ExitCode.SUCCESS;
+      try {
+        fs.writeFileSync(targetPolicy, content, { encoding: "utf-8", flag: "wx" });
+        console.log(pc.green(`✓ Initialized starter policy (${templateType}) at: ${targetPolicy}`));
+        process.exitCode = ExitCode.SUCCESS;
+      } catch (writeErr) {
+        if ((writeErr as NodeJS.ErrnoException).code === "EEXIST") {
+          console.log(pc.yellow(`Policy file already exists at: ${targetPolicy}`));
+          process.exitCode = ExitCode.SUCCESS;
+          return;
+        }
+        throw writeErr;
+      }
     } catch (err) {
       process.stderr.write(pc.red(`Init error: ${(err as Error).message}\n`));
       process.exitCode = ExitCode.INTERNAL_ERROR;
@@ -489,13 +488,32 @@ program
   .action((targetPath?: string, options?: { json?: boolean }) => {
     try {
       const baselineFile = path.resolve(process.cwd(), targetPath || ".mcp-shield-baseline.json");
-      if (!fs.existsSync(baselineFile)) {
-        process.stderr.write(pc.red(`Error: Baseline file not found at: ${baselineFile}\n`));
+      let content: string;
+      try {
+        content = fs.readFileSync(baselineFile, "utf-8");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+          process.stderr.write(pc.red(`Error: Baseline file not found at: ${baselineFile}\n`));
+        } else {
+          process.stderr.write(pc.red(`Error: Invalid or unreadable baseline file at: ${baselineFile}\n`));
+        }
         process.exitCode = ExitCode.USAGE_ERROR;
         return;
       }
 
-      const data = loadBaseline(baselineFile);
+      let data: BaselineFile | undefined;
+      try {
+        const parsed = JSON.parse(content) as unknown;
+        if (
+          typeof parsed === "object" &&
+          parsed !== null &&
+          "findings" in parsed &&
+          Array.isArray((parsed as { findings: unknown }).findings)
+        ) {
+          data = parsed as BaselineFile;
+        }
+      } catch {}
+
       if (!data) {
         process.stderr.write(pc.red(`Error: Invalid or unreadable baseline file at: ${baselineFile}\n`));
         process.exitCode = ExitCode.USAGE_ERROR;
