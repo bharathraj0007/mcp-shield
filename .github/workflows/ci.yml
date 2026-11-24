@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
 jobs:
   test:
     name: Test on ${{ matrix.os }} (Node ${{ matrix.node-version }})
@@ -54,6 +59,7 @@ jobs:
 
       - name: Upload SARIF report
         if: matrix.os == 'ubuntu-latest' && matrix.node-version == 20
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
+        continue-on-error: true
         with:
           sarif_file: mcp-shield.sarif
