@@ -119,15 +119,89 @@ function formatEnvValue(val: string): string {
   return val;
 }
 
+function readTextFileSecurely(filePath: string, symlinkErrorMessage?: string): string {
+  const resolved = path.resolve(filePath);
+
+  // On platforms lacking O_NOFOLLOW (e.g. Windows), inspect lstat before opening
+  if (!fs.constants.O_NOFOLLOW) {
+    try {
+      if (fs.lstatSync(resolved).isSymbolicLink()) {
+        throw new Error(symlinkErrorMessage || `Refusing to access symbolic link: ${resolved}`);
+      }
+    } catch (err: unknown) {
+      if ((err as Error).message.includes("symbolic link")) throw err;
+    }
+  }
+
+  const noFollowFlag = fs.constants.O_NOFOLLOW ?? 0;
+  let fd: number;
+  try {
+    fd = fs.openSync(resolved, fs.constants.O_RDONLY | noFollowFlag);
+  } catch (openErr: unknown) {
+    const code = (openErr as NodeJS.ErrnoException).code;
+    if (code === "ELOOP") {
+      throw new Error(symlinkErrorMessage || `Refusing to access symbolic link: ${resolved}`);
+    }
+    if (code === "EINVAL" && noFollowFlag !== 0) {
+      fd = fs.openSync(resolved, fs.constants.O_RDONLY);
+    } else {
+      throw openErr;
+    }
+  }
+
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) {
+      throw new Error(`Expected a regular file: ${resolved}`);
+    }
+    return fs.readFileSync(fd, "utf-8");
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {}
+  }
+}
+
+function writeTextFileAtomically(targetPath: string, content: string, mode: number = 0o644): void {
+  const resolved = path.resolve(targetPath);
+  const targetDir = path.dirname(resolved);
+  const tmpPath = path.join(
+    targetDir,
+    `.${path.basename(resolved)}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`
+  );
+
+  const fd = fs.openSync(
+    tmpPath,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+    mode
+  );
+  try {
+    fs.writeFileSync(fd, content, "utf-8");
+    fs.fsyncSync(fd);
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {}
+  }
+
+  try {
+    fs.renameSync(tmpPath, resolved);
+  } catch (renameErr) {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {}
+    throw renameErr;
+  }
+}
+
 export function executeRollback(backupPath: string): FixResult {
   const resolvedBackup = path.resolve(backupPath);
   let backupContent: string;
   try {
-    const bStat = fs.lstatSync(resolvedBackup);
-    if (bStat.isSymbolicLink()) {
-      throw new Error(`Refusing to restore from symbolic link: ${backupPath}`);
-    }
-    backupContent = fs.readFileSync(resolvedBackup, "utf-8");
+    backupContent = readTextFileSecurely(
+      resolvedBackup,
+      `Refusing to restore from symbolic link: ${backupPath}`
+    );
   } catch (err: unknown) {
     if ((err as Error).message.includes("symbolic link")) throw err;
     throw new Error(`Backup file not found: ${backupPath}`);
@@ -150,7 +224,7 @@ export function executeRollback(backupPath: string): FixResult {
     }
   }
 
-  fs.writeFileSync(targetConfig, backupContent, "utf-8");
+  writeTextFileAtomically(targetConfig, backupContent, 0o644);
 
   // Check if matching .env.mcp backup exists
   const targetDir = path.dirname(targetConfig);
@@ -166,8 +240,8 @@ export function executeRollback(backupPath: string): FixResult {
       .reverse();
     if (envBaks.length > 0 && envBaks[0]) {
       envBackupFound = path.join(targetDir, envBaks[0]);
-      const envContent = fs.readFileSync(envBackupFound, "utf-8");
-      fs.writeFileSync(envFile, envContent, { mode: 0o600, encoding: "utf-8" });
+      const envContent = readTextFileSecurely(envBackupFound);
+      writeTextFileAtomically(envFile, envContent, 0o600);
     }
   } catch {}
 
@@ -201,11 +275,10 @@ export function executeSafeFix(
   const resolvedPath = path.resolve(options.targetPath);
   let rawContent: string;
   try {
-    const lstat = fs.lstatSync(resolvedPath);
-    if (lstat.isSymbolicLink()) {
-      throw new Error(`Refusing to modify symbolic link: ${resolvedPath}`);
-    }
-    rawContent = fs.readFileSync(resolvedPath, "utf-8");
+    rawContent = readTextFileSecurely(
+      resolvedPath,
+      `Refusing to modify symbolic link: ${resolvedPath}`
+    );
   } catch (err: unknown) {
     if ((err as Error).message.includes("symbolic link")) throw err;
     throw new Error(`Target configuration file not found: ${options.targetPath}`);
@@ -245,15 +318,18 @@ export function executeSafeFix(
   let existingEnvContent = "";
   let existingKeyMap = new Map<string, string>();
   try {
-    const envLstat = fs.lstatSync(envFile);
-    if (envLstat.isSymbolicLink()) {
-      throw new Error(`Refusing to write to symbolic link env file: ${envFile}`);
-    }
-    existingEnvContent = fs.readFileSync(envFile, "utf-8");
+    existingEnvContent = readTextFileSecurely(
+      envFile,
+      `Refusing to write to symbolic link env file: ${envFile}`
+    );
     const parsedEnv = parseEnvFile(existingEnvContent);
     existingKeyMap = parsedEnv.keyMap;
   } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+    if ((err as Error).message.includes("symbolic link")) {
+      throw err;
+    }
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") {
       throw err;
     }
   }
@@ -400,12 +476,12 @@ export function executeSafeFix(
   // 1. Create backups
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const configBackupFile = `${resolvedPath}.${timestamp}.bak`;
-  fs.writeFileSync(configBackupFile, rawContent, "utf-8");
+  writeTextFileAtomically(configBackupFile, rawContent, 0o644);
 
   let envBackupFile: string | undefined;
-  if (fs.existsSync(envFile)) {
+  if (existingEnvContent) {
     envBackupFile = `${envFile}.${timestamp}.bak`;
-    fs.writeFileSync(envBackupFile, existingEnvContent, "utf-8");
+    writeTextFileAtomically(envBackupFile, existingEnvContent, 0o600);
   }
 
   // 2. Perform structure-preserving JSONC edit
@@ -438,15 +514,43 @@ export function executeSafeFix(
   }
 
   // 4. Atomic file write via temp files
-  const tmpConfig = `${resolvedPath}.tmp.${Date.now()}`;
-  const tmpEnv = `${envFile}.tmp.${Date.now()}`;
+  const tmpConfig = path.join(
+    targetDir,
+    `.${path.basename(resolvedPath)}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`
+  );
+  const tmpEnv = path.join(
+    targetDir,
+    `.${path.basename(envFile)}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`
+  );
 
   try {
-    fs.writeFileSync(tmpConfig, updatedContent, "utf-8");
-    fs.writeFileSync(tmpEnv, finalEnvContent, {
-      mode: process.platform === "win32" ? undefined : 0o600,
-      encoding: "utf-8",
-    });
+    const configFd = fs.openSync(
+      tmpConfig,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+      0o644
+    );
+    try {
+      fs.writeFileSync(configFd, updatedContent, "utf-8");
+      fs.fsyncSync(configFd);
+    } finally {
+      try {
+        fs.closeSync(configFd);
+      } catch {}
+    }
+
+    const envFd = fs.openSync(
+      tmpEnv,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+      0o600
+    );
+    try {
+      fs.writeFileSync(envFd, finalEnvContent, "utf-8");
+      fs.fsyncSync(envFd);
+    } finally {
+      try {
+        fs.closeSync(envFd);
+      } catch {}
+    }
 
     // Atomic renames
     fs.renameSync(tmpConfig, resolvedPath);
@@ -460,13 +564,17 @@ export function executeSafeFix(
   } catch (err) {
     // Rollback on partial failure
     try {
-      if (fs.existsSync(tmpConfig)) fs.unlinkSync(tmpConfig);
-      if (fs.existsSync(tmpEnv)) fs.unlinkSync(tmpEnv);
-      if (fs.existsSync(configBackupFile)) {
-        fs.writeFileSync(resolvedPath, rawContent, "utf-8");
+      try {
+        fs.unlinkSync(tmpConfig);
+      } catch {}
+      try {
+        fs.unlinkSync(tmpEnv);
+      } catch {}
+      if (configBackupFile) {
+        writeTextFileAtomically(resolvedPath, rawContent, 0o644);
       }
-      if (envBackupFile && fs.existsSync(envBackupFile)) {
-        fs.writeFileSync(envFile, existingEnvContent, "utf-8");
+      if (envBackupFile) {
+        writeTextFileAtomically(envFile, existingEnvContent, 0o600);
       }
     } catch {}
     throw new Error(`Atomic write failed: ${(err as Error).message}. Rolled back to original files.`);

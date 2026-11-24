@@ -338,8 +338,26 @@ export function parseConfigFile(
 ): NormalizedMcpServer[] {
   const resolvedPath = path.resolve(expandHome(filePath));
 
+  const noFollowFlag = fs.constants.O_NOFOLLOW ?? 0;
+  let fd: number;
   try {
-    const stat = fs.lstatSync(resolvedPath);
+    fd = fs.openSync(resolvedPath, fs.constants.O_RDONLY | noFollowFlag);
+  } catch (openErr: unknown) {
+    const code = (openErr as NodeJS.ErrnoException).code;
+    if (code === "EINVAL" && noFollowFlag !== 0) {
+      try {
+        fd = fs.openSync(resolvedPath, fs.constants.O_RDONLY);
+      } catch {
+        return [];
+      }
+    } else {
+      return [];
+    }
+  }
+
+  let content: string;
+  try {
+    const stat = fs.fstatSync(fd);
     if (!stat.isFile()) {
       return [];
     }
@@ -347,15 +365,13 @@ export function parseConfigFile(
       process.stderr.write(`Warning: Config file ${resolvedPath} exceeds 5 MB limit. Skipping.\n`);
       return [];
     }
+    content = fs.readFileSync(fd, "utf-8");
   } catch {
     return [];
-  }
-
-  let content: string;
-  try {
-    content = fs.readFileSync(resolvedPath, "utf-8");
-  } catch {
-    return [];
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {}
   }
 
   const parsed = parseConfigContent(content, resolvedPath);
