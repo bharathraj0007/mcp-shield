@@ -1,7 +1,7 @@
 # mcp-shield
 
 [![CI](https://github.com/bharathraj0007/mcp-shield/actions/workflows/ci.yml/badge.svg)](https://github.com/bharathraj0007/mcp-shield/actions/workflows/ci.yml)
-[![npm version](https://img.shields.io/npm/v/@bharathraj0007/mcp-shield.svg)](https://www.npmjs.com/package/@bharathraj0007/mcp-shield)
+[![npm version](https://img.shields.io/npm/v/@bharathraj_07/mcp-shield.svg)](https://www.npmjs.com/package/@bharathraj_07/mcp-shield)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20.0.0-green.svg)](https://nodejs.org)
 [![Telemetry](https://img.shields.io/badge/telemetry-zero%20(100%25%20offline)-success.svg)](SECURITY.md)
@@ -23,10 +23,10 @@ The tool operates **100% offline**. It sends no data over the network and collec
 
 ```bash
 # Option A: Install globally from npm
-npm install -g @bharathraj0007/mcp-shield
+npm install -g @bharathraj_07/mcp-shield
 
 # Option B: Run directly via npx
-npx @bharathraj0007/mcp-shield scan
+npx @bharathraj_07/mcp-shield scan
 
 # Option C: Build from source (100% offline)
 git clone https://github.com/bharathraj0007/mcp-shield.git
@@ -206,6 +206,11 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
 jobs:
   mcp-shield:
     runs-on: ubuntu-latest
@@ -217,10 +222,11 @@ jobs:
           node-version: 20
 
       - name: Run mcp-shield Scan
-        run: npx @bharathraj0007/mcp-shield scan . --format sarif > mcp-shield.sarif
+        run: npx @bharathraj_07/mcp-shield scan . --format sarif > mcp-shield.sarif
 
       - name: Upload SARIF report
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
+        continue-on-error: true
         with:
           sarif_file: mcp-shield.sarif
 ```
