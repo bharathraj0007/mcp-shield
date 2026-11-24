@@ -1,7 +1,10 @@
+import * as crypto from "node:crypto";
 import type {
   NormalizedMcpServer,
   ScanFinding,
   PolicyConfig,
+  FindingConfidence,
+  RuleDefinition,
 } from "../types/index.js";
 
 /**
@@ -35,23 +38,19 @@ export function maskSecret(secret: string): string {
   return `${prefix}***...${suffix}`;
 }
 
-const KNOWN_SECRET_PATTERNS: readonly { readonly name: string; readonly regex: RegExp }[] = [
-  { name: "OpenAI API Key", regex: /\b(sk-[a-zA-Z0-9_\-]{20,})\b/ },
-  { name: "Anthropic API Key", regex: /\b(sk-ant-[a-zA-Z0-9_\-]{20,})\b/ },
-  { name: "GitHub Personal Access Token", regex: /\b(ghp_[a-zA-Z0-9]{36})\b/ },
-  { name: "GitHub Fine-Grained Token", regex: /\b(github_pat_[a-zA-Z0-9_]{22,})\b/ },
-  { name: "AWS Access Key ID", regex: /\b(AKIA[0-9A-Z]{16})\b/ },
-  { name: "Google Cloud API Key", regex: /\b(AIza[0-9A-Za-z-_]{35})\b/ },
-  { name: "Slack Token", regex: /\b(xox[baprs]-[0-9a-zA-Z]{10,})\b/ },
-  { name: "Stripe Live Key", regex: /\b(sk_live_[0-9a-zA-Z]{24,})\b/ },
-  { name: "Bearer Token", regex: /\bBearer\s+([a-zA-Z0-9_\-\.]{20,})\b/i },
-  {
-    name: "Database Password URI",
-    regex: /(?:postgres|mysql|mongodb(?:\+srv)?):\/\/[^:\s]+:([^@\s]+)@/i,
-  },
-];
+export function computeFindingFingerprint(
+  ruleId: string,
+  filePath: string,
+  serverName: string,
+  location: string,
+  discriminator: string
+): string {
+  const normalizedFile = filePath.replace(/\\/g, "/");
+  const raw = `${ruleId}:${normalizedFile}:${serverName}:${location}:${discriminator}`;
+  return crypto.createHash("sha256").update(raw).digest("hex");
+}
 
-function isSafePlaceholder(val: string): boolean {
+export function isSafePlaceholder(val: string): boolean {
   const trimmed = val.trim();
   if (trimmed.startsWith("${") && trimmed.endsWith("}")) return true;
   if (/^\$[A-Z0-9_]+$/.test(trimmed)) return true;
@@ -67,35 +66,157 @@ function isSafePlaceholder(val: string): boolean {
   );
 }
 
-// Invisible unicode detection regex
-const UNICODE_EVASION_REGEX =
-  /[\u200B-\u200F\u202A-\u202E\uFEFF]|[\uD83C][\uDC00-\uDC7F]|[\uD83E][\uDD00-\uDDFF]/u;
+interface SecretPatternDef {
+  readonly name: string;
+  readonly type: string;
+  readonly regex: RegExp;
+  readonly confidence: FindingConfidence;
+}
 
-const INJECTION_PHRASES = [
-  "ignore previous instructions",
-  "disregard instructions",
-  "do not tell the user",
-  "exfiltrate",
-  "read ~/.ssh",
-  "read /etc/passwd",
-  "<important>",
-  "system prompt:",
+const KNOWN_SECRET_PATTERNS: readonly SecretPatternDef[] = [
+  {
+    name: "Anthropic API Key",
+    type: "anthropic",
+    regex: /\b(sk-ant-[a-zA-Z0-9_\-]{20,})\b/,
+    confidence: "high",
+  },
+  {
+    name: "OpenAI API Key",
+    type: "openai",
+    regex: /\b(sk-[a-zA-Z0-9_\-]{20,})\b/,
+    confidence: "high",
+  },
+  {
+    name: "GitHub Personal Access Token (Classic)",
+    type: "github_pat_classic",
+    regex: /\b(ghp_[a-zA-Z0-9]{36})\b/,
+    confidence: "high",
+  },
+  {
+    name: "GitHub Fine-Grained Token",
+    type: "github_pat_fine",
+    regex: /\b(github_pat_[a-zA-Z0-9_]{22,})\b/,
+    confidence: "high",
+  },
+  {
+    name: "AWS Access Key ID",
+    type: "aws_access_key",
+    regex: /\b(AKIA[0-9A-Z]{16})\b/,
+    confidence: "high",
+  },
+  {
+    name: "Google Cloud API Key",
+    type: "google_api_key",
+    regex: /\b(AIza[0-9A-Za-z-_]{35})\b/,
+    confidence: "high",
+  },
+  {
+    name: "Slack Token",
+    type: "slack_token",
+    regex: /\b(xox[baprs]-[0-9a-zA-Z]{10,})\b/,
+    confidence: "high",
+  },
+  {
+    name: "Stripe Live Key",
+    type: "stripe_live",
+    regex: /\b(sk_live_[0-9a-zA-Z]{24,})\b/,
+    confidence: "high",
+  },
+  {
+    name: "npm Access Token",
+    type: "npm_token",
+    regex: /\b(npm_[a-zA-Z0-9]{36})\b/,
+    confidence: "high",
+  },
+  {
+    name: "Azure Access / Connection Key",
+    type: "azure_key",
+    regex: /(?:AccountKey|SharedAccessSignature)=([a-zA-Z0-9+/=]{20,})/i,
+    confidence: "high",
+  },
+  {
+    name: "Twilio API Key",
+    type: "twilio_key",
+    regex: /\b(SK[0-9a-fA-F]{32})\b/,
+    confidence: "high",
+  },
+  {
+    name: "JSON Web Token (JWT)",
+    type: "jwt",
+    regex: /\b(ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/,
+    confidence: "high",
+  },
+  {
+    name: "PEM Private Key",
+    type: "pem_private_key",
+    regex: /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/,
+    confidence: "high",
+  },
+  {
+    name: "Database Password URI",
+    type: "db_password_uri",
+    regex: /(?:postgres|postgresql|mysql|mongodb|mongodb\+srv|redis|amqp|mssql):\/\/[^:\s]+:([^@\s]+)@/i,
+    confidence: "high",
+  },
+  {
+    name: "Bearer Token",
+    type: "bearer_token",
+    regex: /\bBearer\s+([a-zA-Z0-9_\-\.]{20,})\b/i,
+    confidence: "high",
+  },
+  {
+    name: "Basic Auth Token",
+    type: "basic_token",
+    regex: /\bBasic\s+([a-zA-Z0-9+/=]{16,})\b/i,
+    confidence: "high",
+  },
 ];
+
+const SENSITIVE_KEY_NAME_REGEX =
+  /(?:api[_-]?key|secret|token|auth|password|passwd|credential|private[_-]?key|access[_-]?key)/i;
+
+function matchesExcludePattern(filePath: string, patterns: readonly string[]): boolean {
+  const normalized = filePath.replace(/\\/g, "/");
+  for (const pat of patterns) {
+    const clean = pat.replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*");
+    const reg = new RegExp(clean, "i");
+    if (reg.test(normalized)) return true;
+  }
+  return false;
+}
 
 /**
  * Check RULE-001 (MS-001): Hardcoded Secrets Exposure
  */
-export function checkSecretLeak(server: NormalizedMcpServer): ScanFinding[] {
+export function checkSecretLeak(
+  server: NormalizedMcpServer,
+  policy?: PolicyConfig
+): ScanFinding[] {
   const findings: ScanFinding[] = [];
 
-  const inspectValue = (val: string, location: string) => {
+  if (policy?.secretDetection?.exclude && matchesExcludePattern(server.configPath, policy.secretDetection.exclude)) {
+    return findings;
+  }
+
+  const sensitivity = policy?.secretDetection?.sensitivity || "balanced";
+
+  const inspectValue = (val: string, location: string, keyName?: string) => {
     if (isSafePlaceholder(val)) return;
 
+    // 1. Check known provider signature patterns (High Confidence)
     for (const pat of KNOWN_SECRET_PATTERNS) {
       const match = pat.regex.exec(val);
-      if (match && match[1]) {
-        const rawSecret = match[1];
-        if (!isSafePlaceholder(rawSecret)) {
+      if (match) {
+        const rawSecret = match[1] || match[0];
+        if (rawSecret && !isSafePlaceholder(rawSecret)) {
+          const fingerprint = computeFindingFingerprint(
+            "MS-001",
+            server.configPath,
+            server.serverName,
+            location,
+            pat.type
+          );
+
           findings.push({
             ruleId: "MS-001",
             owaspId: "MCP01:2025",
@@ -106,26 +227,101 @@ export function checkSecretLeak(server: NormalizedMcpServer): ScanFinding[] {
             serverName: server.serverName,
             maskedEvidence: maskSecret(rawSecret),
             fixSuggestion: `Move secret to environment variable or .env file and reference with \${VAR_NAME}.`,
+            confidence: pat.confidence,
+            reason: `Matches known ${pat.name} signature format.`,
+            fingerprint,
           });
           return;
         }
       }
     }
 
-    // High Shannon entropy check
-    if (val.length >= 20 && calculateShannonEntropy(val) >= 4.5) {
-      // Avoid flagging standard filesystem paths or command strings
-      if (!val.includes("/") && !val.includes("\\") && !val.includes(" ")) {
+    // 2. AWS Secret Access Key contextual check (40 alphanumeric/slash chars in AWS key context)
+    if (keyName && /(?:aws|amazon).*(?:secret|key)/i.test(keyName)) {
+      const match = /\b([0-9a-zA-Z/+=]{40})\b/.exec(val);
+      if (match && match[1] && !isSafePlaceholder(match[1])) {
+        const rawSecret = match[1];
+        const fingerprint = computeFindingFingerprint(
+          "MS-001",
+          server.configPath,
+          server.serverName,
+          location,
+          "aws_secret_key"
+        );
         findings.push({
           ruleId: "MS-001",
           owaspId: "MCP01:2025",
           severity: "critical",
-          title: "High-Entropy Secret Detected",
-          message: `Server "${server.serverName}" contains high-entropy string in ${location}.`,
+          title: "Hardcoded AWS Secret Access Key Detected",
+          message: `Server "${server.serverName}" exposes hardcoded AWS Secret Access Key in ${location}.`,
+          file: server.configPath,
+          serverName: server.serverName,
+          maskedEvidence: maskSecret(rawSecret),
+          fixSuggestion: `Move secret to environment variable or .env file and reference with \${VAR_NAME}.`,
+          confidence: "high",
+          reason: "Matches 40-character AWS secret access key in AWS credential context.",
+          fingerprint,
+        });
+        return;
+      }
+    }
+
+    // 3. Contextual scoring: Sensitive Key Name + High Entropy (Medium Confidence)
+    const hasSensitiveKeyName = keyName ? SENSITIVE_KEY_NAME_REGEX.test(keyName) : false;
+    const entropy = calculateShannonEntropy(val);
+
+    if (hasSensitiveKeyName && val.length >= 20 && entropy >= 4.0) {
+      if (!val.includes("/") && !val.includes("\\") && !val.includes(" ")) {
+        if (sensitivity === "balanced" || sensitivity === "strict") {
+          const fingerprint = computeFindingFingerprint(
+            "MS-001",
+            server.configPath,
+            server.serverName,
+            location,
+            "high_entropy_key"
+          );
+          findings.push({
+            ruleId: "MS-001",
+            owaspId: "MCP01:2025",
+            severity: "critical",
+            title: "High-Entropy Credential Detected",
+            message: `Server "${server.serverName}" contains high-entropy credential string in ${location}.`,
+            file: server.configPath,
+            serverName: server.serverName,
+            maskedEvidence: maskSecret(val),
+            fixSuggestion: `Move secret to environment variable and reference with \${VAR_NAME}.`,
+            confidence: "medium",
+            reason: `High Shannon entropy (${entropy.toFixed(2)}) assigned to sensitive key name "${keyName}".`,
+            fingerprint,
+          });
+          return;
+        }
+      }
+    }
+
+    // 4. Strict Mode: standalone high entropy without sensitive key name (Low Confidence)
+    if (sensitivity === "strict" && val.length >= 28 && entropy >= 4.8) {
+      if (!val.includes("/") && !val.includes("\\") && !val.includes(" ")) {
+        const fingerprint = computeFindingFingerprint(
+          "MS-001",
+          server.configPath,
+          server.serverName,
+          location,
+          "standalone_entropy"
+        );
+        findings.push({
+          ruleId: "MS-001",
+          owaspId: "MCP01:2025",
+          severity: "high",
+          title: "Suspicious High-Entropy String Detected",
+          message: `Server "${server.serverName}" contains high-entropy value in ${location}.`,
           file: server.configPath,
           serverName: server.serverName,
           maskedEvidence: maskSecret(val),
-          fixSuggestion: `Move secret to environment variable and reference with \${VAR_NAME}.`,
+          fixSuggestion: `Verify if value is a credential and migrate to environment variable if sensitive.`,
+          confidence: "low",
+          reason: `High Shannon entropy (${entropy.toFixed(2)}) detected under strict inspection mode.`,
+          fingerprint,
         });
       }
     }
@@ -133,7 +329,7 @@ export function checkSecretLeak(server: NormalizedMcpServer): ScanFinding[] {
 
   if (server.env) {
     for (const [key, val] of Object.entries(server.env)) {
-      inspectValue(val, `env.${key}`);
+      inspectValue(val, `env.${key}`, key);
     }
   }
 
@@ -148,7 +344,7 @@ export function checkSecretLeak(server: NormalizedMcpServer): ScanFinding[] {
 
   if (server.headers) {
     for (const [header, val] of Object.entries(server.headers)) {
-      inspectValue(val, `headers.${header}`);
+      inspectValue(val, `headers.${header}`, header);
     }
   }
 
@@ -179,6 +375,13 @@ export function checkUnsafePath(server: NormalizedMcpServer): ScanFinding[] {
 
     for (const pat of dangerousPaths) {
       if (pat.test(arg.trim())) {
+        const fingerprint = computeFindingFingerprint(
+          "MS-002",
+          server.configPath,
+          server.serverName,
+          `args[${i}]`,
+          arg
+        );
         findings.push({
           ruleId: "MS-002",
           owaspId: "MCP02:2025",
@@ -189,6 +392,9 @@ export function checkUnsafePath(server: NormalizedMcpServer): ScanFinding[] {
           serverName: server.serverName,
           maskedEvidence: arg,
           fixSuggestion: `Restrict filesystem server scope to a designated project subfolder (e.g. "./docs" or "./workspace").`,
+          confidence: "high",
+          reason: `Path matches dangerous directory pattern (${pat.source}).`,
+          fingerprint,
         });
         break;
       }
@@ -198,20 +404,42 @@ export function checkUnsafePath(server: NormalizedMcpServer): ScanFinding[] {
   return findings;
 }
 
+const INJECTION_PHRASES = [
+  "ignore previous instructions",
+  "disregard instructions",
+  "do not tell the user",
+  "exfiltrate",
+  "read ~/.ssh",
+  "read /etc/passwd",
+  "<important>",
+  "system prompt:",
+];
+
 /**
  * Check RULE-003 (MS-003): Tool Poisoning & Hidden Injection
  */
 export function checkPromptInjection(server: NormalizedMcpServer): ScanFinding[] {
   const findings: ScanFinding[] = [];
-  const textsToScan: string[] = [];
+  const textsToScan: { text: string; loc: string }[] = [];
 
-  if (server.args) textsToScan.push(...server.args);
-  if (server.env) textsToScan.push(...Object.values(server.env));
+  if (server.args) {
+    server.args.forEach((a, i) => textsToScan.push({ text: a, loc: `args[${i}]` }));
+  }
+  if (server.env) {
+    Object.entries(server.env).forEach(([k, v]) => textsToScan.push({ text: v, loc: `env.${k}` }));
+  }
 
-  for (const text of textsToScan) {
+  for (const { text, loc } of textsToScan) {
     const lower = text.toLowerCase();
     for (const phrase of INJECTION_PHRASES) {
       if (lower.includes(phrase)) {
+        const fingerprint = computeFindingFingerprint(
+          "MS-003",
+          server.configPath,
+          server.serverName,
+          loc,
+          phrase
+        );
         findings.push({
           ruleId: "MS-003",
           owaspId: "MCP03:2025",
@@ -221,25 +449,12 @@ export function checkPromptInjection(server: NormalizedMcpServer): ScanFinding[]
           file: server.configPath,
           serverName: server.serverName,
           maskedEvidence: phrase,
-          fixSuggestion: `Remove override instructions and untrusted prompt text from server arguments.`,
+          fixSuggestion: `Remove natural-language prompt instructions from MCP server execution arguments.`,
+          confidence: "high",
+          reason: `Contains prompt injection phrase "${phrase}".`,
+          fingerprint,
         });
-        break;
       }
-    }
-
-    if (UNICODE_EVASION_REGEX.test(text)) {
-      findings.push({
-        ruleId: "MS-003",
-        owaspId: "MCP03:2025",
-        severity: "critical",
-        title: "Invisible Unicode Obfuscation Detected",
-        message: `Server "${server.serverName}" contains zero-width or BiDi override characters.`,
-        file: server.configPath,
-        serverName: server.serverName,
-        maskedEvidence: "[Invisible Unicode Control Characters]",
-        fixSuggestion: `Strip zero-width and control characters from configuration parameters.`,
-      });
-      break;
     }
   }
 
@@ -247,73 +462,154 @@ export function checkPromptInjection(server: NormalizedMcpServer): ScanFinding[]
 }
 
 /**
- * Check RULE-004 (MS-004): Unpinned Dependency Tampering
+ * Check RULE-004 (MS-004): Supply Chain Execution Tampering
  */
 export function checkUnpinnedPackage(server: NormalizedMcpServer): ScanFinding[] {
   const findings: ScanFinding[] = [];
-  const cmd = (server.command || "").toLowerCase();
   const args = server.args || [];
+  const cmd = (server.command || "").toLowerCase();
 
-  const isRunner = cmd === "npx" || cmd === "pnpx" || cmd === "uvx" || cmd === "bunx";
-  if (!isRunner) return findings;
+  const isRunner = cmd.includes("npx") || cmd.includes("uvx") || cmd.includes("bunx");
 
-  // Find target package in args
-  for (const arg of args) {
-    if (arg.startsWith("-")) continue; // flags like -y, --yes
-    if (arg.startsWith("./") || arg.startsWith("../") || arg.startsWith("/")) continue;
+  if (isRunner) {
+    for (let i = 0; i < args.length; i++) {
+      const arg = args[i];
+      if (!arg || arg.startsWith("-")) continue;
 
-    // Check if package has version pin (e.g. pkg@1.2.3 or @scope/pkg@1.2.3)
-    const hasPin = /@[0-9]+\.[0-9]+\.[0-9]+/.test(arg);
-    const hasLatest = arg.endsWith("@latest");
-
-    if (!hasPin || hasLatest) {
-      findings.push({
-        ruleId: "MS-004",
-        owaspId: "MCP04:2025",
-        severity: "medium",
-        title: "Unpinned Remote Package Execution",
-        message: `Server "${server.serverName}" runs unpinned package "${arg}" via ${cmd}.`,
-        file: server.configPath,
-        serverName: server.serverName,
-        maskedEvidence: arg,
-        fixSuggestion: `Pin package to an exact semver version (e.g. "${arg}@1.0.0") instead of floating tags.`,
-      });
+      const isPinned = arg.includes("@") && (!arg.startsWith("@") || arg.slice(1).includes("@"));
+      if (!isPinned) {
+        const fingerprint = computeFindingFingerprint(
+          "MS-004",
+          server.configPath,
+          server.serverName,
+          `args[${i}]`,
+          arg
+        );
+        findings.push({
+          ruleId: "MS-004",
+          owaspId: "MCP04:2025",
+          severity: "medium",
+          title: "Unpinned Package Execution",
+          message: `Server "${server.serverName}" runs unpinned package "${arg}" without exact version.`,
+          file: server.configPath,
+          serverName: server.serverName,
+          maskedEvidence: `${server.command || "npx"} ${args.join(" ")}`,
+          fixSuggestion: `Pin package to an exact version (e.g. ${arg}@1.0.0).`,
+          confidence: "high",
+          reason: `Package execution without explicit semver tag (@version).`,
+          fingerprint,
+        });
+      }
+      // Only the first non-flag argument is the runner's target package
       break;
+    }
+  }
+
+  const isContainerRunner = cmd.includes("docker") || cmd.includes("podman");
+  if (isContainerRunner) {
+    const runIdx = args.findIndex((a) => a === "run");
+    if (runIdx !== -1) {
+      let i = runIdx + 1;
+      while (i < args.length) {
+        const a = args[i];
+        if (!a) {
+          i += 1;
+          continue;
+        }
+        if (a.startsWith("-")) {
+          if (
+            [
+              "-v",
+              "-e",
+              "-p",
+              "-u",
+              "-w",
+              "--name",
+              "--network",
+              "--env",
+              "--volume",
+              "--workdir",
+              "--user",
+            ].includes(a)
+          ) {
+            i += 2;
+          } else {
+            i += 1;
+          }
+        } else {
+          const image = a;
+          const isPinned =
+            (image.includes(":") && !image.endsWith(":latest")) || image.includes("@sha256:");
+          if (!isPinned) {
+            const fingerprint = computeFindingFingerprint(
+              "MS-004",
+              server.configPath,
+              server.serverName,
+              `args[${i}]`,
+              image
+            );
+            findings.push({
+              ruleId: "MS-004",
+              owaspId: "MCP04:2025",
+              severity: "medium",
+              title: "Unpinned Container Image Execution",
+              message: `Server "${server.serverName}" runs unpinned container image "${image}" without exact tag/digest.`,
+              file: server.configPath,
+              serverName: server.serverName,
+              maskedEvidence: `${server.command || "docker"} ${args.join(" ")}`,
+              fixSuggestion: `Pin container image to an exact tag or digest (e.g. ${image}:1.0.0 or ${image}@sha256:...).`,
+              confidence: "high",
+              reason: `Container image without explicit pinned tag (ends with :latest or lacks tag).`,
+              fingerprint,
+            });
+          }
+          break;
+        }
+      }
     }
   }
 
   return findings;
 }
 
+const DANGEROUS_COMMANDS = [
+  /\brm\s+-[a-zA-Z]*r[a-zA-Z]*f\b/i,
+  /(?:curl|wget)\s+[^|]+\|\s*(?:sh|bash|zsh)/i,
+  /\bchmod\s+777\b/i,
+  /\b(?:mkfs\b|dd\s+if=)/i,
+  /\bnc\s+-[a-zA-Z]*e\b/i,
+  /(?:powershell|pwsh).*(?:-enc|-encodedcommand)\b/i,
+];
+
 /**
- * Check RULE-005 (MS-005): Dangerous Shell Command Injection
+ * Check RULE-005 (MS-005): Dangerous Command Execution Patterns
  */
 export function checkDangerousCommand(server: NormalizedMcpServer): ScanFinding[] {
   const findings: ScanFinding[] = [];
-  const fullCommandString = [server.command || "", ...(server.args || [])].join(" ");
+  const fullCommand = [server.command, ...(server.args || [])].filter(Boolean).join(" ");
 
-  const dangerousShellPatterns: readonly { readonly name: string; readonly regex: RegExp }[] = [
-    { name: "Recursive Deletion", regex: /\brm\s+-[a-zA-Z]*r[a-zA-Z]*f\b/i },
-    { name: "Remote Shell Pipe", regex: /(?:curl|wget)\s+[^|]+\|\s*(?:sh|bash|zsh)/i },
-    { name: "Global Permission Escalation", regex: /\bchmod\s+777\b/i },
-    { name: "Filesystem Formatting", regex: /\b(?:mkfs|dd\s+if=)\b/i },
-    { name: "Reverse Shell Listener", regex: /\bnc\s+-[a-zA-Z]*e\b/i },
-    { name: "Encoded PowerShell Execution", regex: /(?:powershell|pwsh).*(?:-enc|-encodedcommand)\b/i },
-    { name: "Unescaped Shell Chaining", regex: /[;&|`]|(?:\$\([^)]+\))/ },
-  ];
-
-  for (const pat of dangerousShellPatterns) {
-    if (pat.regex.test(fullCommandString)) {
+  for (const pat of DANGEROUS_COMMANDS) {
+    if (pat.test(fullCommand)) {
+      const fingerprint = computeFindingFingerprint(
+        "MS-005",
+        server.configPath,
+        server.serverName,
+        "command",
+        pat.source
+      );
       findings.push({
         ruleId: "MS-005",
         owaspId: "MCP05:2025",
         severity: "critical",
-        title: `Destructive Command Execution: ${pat.name}`,
-        message: `Server "${server.serverName}" contains risky shell pattern matching ${pat.name}.`,
+        title: "Destructive Shell Command Detected",
+        message: `Server "${server.serverName}" executes dangerous command pattern.`,
         file: server.configPath,
         serverName: server.serverName,
-        maskedEvidence: fullCommandString.slice(0, 80),
-        fixSuggestion: `Avoid executing shell wrappers or destructive commands in MCP server definitions.`,
+        maskedEvidence: fullCommand.slice(0, 60),
+        fixSuggestion: `Replace dangerous inline shell command with an isolated, dedicated MCP binary.`,
+        confidence: "high",
+        reason: `Command line matches destructive pattern (${pat.source}).`,
+        fingerprint,
       });
       break;
     }
@@ -323,7 +619,7 @@ export function checkDangerousCommand(server: NormalizedMcpServer): ScanFinding[
 }
 
 /**
- * Check RULE-006 (MS-006): Insecure Plaintext HTTP Transport
+ * Check RULE-006 (MS-006): Insecure Transport
  */
 export function checkInsecureTransport(server: NormalizedMcpServer): ScanFinding[] {
   const findings: ScanFinding[] = [];
@@ -332,30 +628,32 @@ export function checkInsecureTransport(server: NormalizedMcpServer): ScanFinding
   try {
     const parsed = new URL(server.url);
     if (parsed.protocol === "http:") {
-      const hostname = parsed.hostname.toLowerCase();
-      const isLocal =
-        hostname === "localhost" ||
-        hostname === "127.0.0.1" ||
-        hostname === "::1" ||
-        hostname === "[::1]";
-
-      if (!isLocal) {
+      const host = parsed.hostname.toLowerCase();
+      if (host !== "localhost" && host !== "127.0.0.1" && host !== "::1") {
+        const fingerprint = computeFindingFingerprint(
+          "MS-006",
+          server.configPath,
+          server.serverName,
+          "url",
+          server.url
+        );
         findings.push({
           ruleId: "MS-006",
           owaspId: "MCP07:2025",
           severity: "high",
-          title: "Insecure Plaintext HTTP Transport",
-          message: `Server "${server.serverName}" connects over unencrypted HTTP to remote endpoint "${parsed.hostname}".`,
+          title: "Insecure Plaintext Transport Detected",
+          message: `Server "${server.serverName}" uses unencrypted HTTP transport (${server.url}).`,
           file: server.configPath,
           serverName: server.serverName,
           maskedEvidence: server.url,
           fixSuggestion: `Use encrypted HTTPS transport for remote MCP servers.`,
+          confidence: "high",
+          reason: `Plaintext HTTP endpoint on remote host ${host}.`,
+          fingerprint,
         });
       }
     }
-  } catch {
-    // Malformed URL, skip transport check
-  }
+  } catch {}
 
   return findings;
 }
@@ -373,6 +671,13 @@ export function checkShadowServer(
   }
 
   if (!policy.allowedServers.includes(server.serverName)) {
+    const fingerprint = computeFindingFingerprint(
+      "MS-007",
+      server.configPath,
+      server.serverName,
+      "serverName",
+      server.serverName
+    );
     findings.push({
       ruleId: "MS-007",
       owaspId: "MCP09:2025",
@@ -383,6 +688,9 @@ export function checkShadowServer(
       serverName: server.serverName,
       maskedEvidence: server.serverName,
       fixSuggestion: `Register "${server.serverName}" in policy.yaml allowedServers or disable the server.`,
+      confidence: "high",
+      reason: "Server name missing from policy.yaml allowedServers list.",
+      fingerprint,
     });
   }
 
@@ -405,7 +713,7 @@ export function evaluateServerRules(
     }
   };
 
-  runCheck("MS-001", () => checkSecretLeak(server));
+  runCheck("MS-001", () => checkSecretLeak(server, policy));
   runCheck("MS-002", () => checkUnsafePath(server));
   runCheck("MS-003", () => checkPromptInjection(server));
   runCheck("MS-004", () => checkUnpinnedPackage(server));
@@ -415,3 +723,62 @@ export function evaluateServerRules(
 
   return allFindings;
 }
+
+export const RULE_DEFINITIONS: readonly RuleDefinition[] = [
+  {
+    id: "MS-001",
+    owaspId: "MCP01:2025",
+    severity: "critical",
+    title: "Secret Leak Detection",
+    description: "Detects plaintext API keys, tokens, and credentials in MCP configurations.",
+    remediation: "Extract hardcoded secrets into environment variables or a protected .env.mcp file.",
+  },
+  {
+    id: "MS-002",
+    owaspId: "MCP02:2025",
+    severity: "high",
+    title: "Unsafe Path Traversal",
+    description: "Detects path traversal sequences (../), references to sensitive directories (.ssh, .aws, .env), or Windows UNC paths.",
+    remediation: "Constrain paths within approved workspace roots and avoid parent directory traversal.",
+  },
+  {
+    id: "MS-003",
+    owaspId: "MCP03:2025",
+    severity: "critical",
+    title: "Prompt Injection Instruction",
+    description: "Detects natural-language override commands embedded inside MCP arguments.",
+    remediation: "Remove natural-language prompt instructions from executable CLI arguments.",
+  },
+  {
+    id: "MS-004",
+    owaspId: "MCP04:2025",
+    severity: "medium",
+    title: "Supply Chain Execution Tampering",
+    description: "Detects execution of unpinned packages (npx/uvx) or container images without explicit semver tags/digests.",
+    remediation: "Pin package versions (e.g. package@1.0.0) or container image tags/digests.",
+  },
+  {
+    id: "MS-005",
+    owaspId: "MCP05:2025",
+    severity: "critical",
+    title: "Destructive Shell Command",
+    description: "Detects destructive shell commands (rm -rf, curl | sh, chmod 777) in server definitions.",
+    remediation: "Replace raw destructive shell command strings with isolated, dedicated MCP binaries.",
+  },
+  {
+    id: "MS-006",
+    owaspId: "MCP07:2025",
+    severity: "high",
+    title: "Insecure Plaintext Transport",
+    description: "Detects remote MCP connections over unencrypted HTTP protocol.",
+    remediation: "Enforce HTTPS encryption for all remote MCP endpoints.",
+  },
+  {
+    id: "MS-007",
+    owaspId: "MCP09:2025",
+    severity: "medium",
+    title: "Shadow MCP Server Detection",
+    description: "Detects active MCP servers that are not explicitly approved in policy allowedServers.",
+    remediation: "Register the server in policy.yaml allowedServers or disable the unapproved server.",
+  },
+];

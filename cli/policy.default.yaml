@@ -1,5 +1,6 @@
 version: "1.0"
-mode: "enforce" # "enforce" | "monitor"
+mode: "enforce" # "monitor" | "enforce" | "baseline" | "quarantine" | "audit-only"
+inherit: []
 denyPaths:
   - "**/.env"
   - "**/.env.*"
@@ -17,3 +18,17 @@ blockedCommands:
 disabledRules: []
 allowedServers: [] # Optional allowlist for MS-007 Shadow MCP detection
 failOnSeverity: "high" # "critical" | "high" | "medium" | "low"
+secretDetection:
+  sensitivity: "balanced" # "low" | "balanced" | "strict"
+  exclude: []
+blockedMethods: []
+allowedTools: []
+deniedTools: []
+allowedHosts: []
+deniedHosts: []
+rugPull:
+  mode: "enforce" # "off" | "monitor" | "approve" | "enforce"
+  persistence: "local"
+  immutableFields:
+    - "description"
+    - "inputSchema"

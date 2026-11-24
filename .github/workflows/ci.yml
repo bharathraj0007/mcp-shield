@@ -30,13 +30,17 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: "npm"
-          cache-dependency-path: cli/package.json
+          cache-dependency-path: cli/package-lock.json
 
       - name: Install dependencies
         working-directory: cli
-        run: npm install
+        run: npm ci
 
-      - name: Type check and build
+      - name: Run TypeScript typecheck
+        working-directory: cli
+        run: npm run typecheck
+
+      - name: Build CLI package
         working-directory: cli
         run: npm run build
 
@@ -48,9 +52,27 @@ jobs:
         working-directory: cli
         run: npm run bench
 
-      - name: Run black-box self-test
+      - name: Run black-box self-test harness
         working-directory: cli
         run: npm run self-test
+
+      - name: Run dependency security audit
+        working-directory: cli
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+      - name: Verify package tarball (dry run)
+        working-directory: cli
+        run: npm pack --dry-run
+
+      - name: Verify global tarball package install and execution
+        working-directory: cli
+        shell: bash
+        run: |
+          npm pack
+          npm install -g ./bharathraj_07-mcp-shield-0.2.0.tgz
+          mcp-shield --version
+          mcp-shield --help
 
       - name: Generate SARIF Security Report
         if: matrix.os == 'ubuntu-latest' && matrix.node-version == 20

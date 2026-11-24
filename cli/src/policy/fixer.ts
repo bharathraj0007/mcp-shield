@@ -1,8 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { parse as parseJsonc } from "jsonc-parser";
+import { parseTree, findNodeAtLocation, modify, applyEdits } from "jsonc-parser";
 import pc from "picocolors";
-import { maskSecret } from "../scanner/rules.js";
+import { maskSecret, isSafePlaceholder } from "../scanner/rules.js";
 
 const SECRET_DETECTION_PATTERNS: readonly RegExp[] = [
   /\b(sk-[a-zA-Z0-9_\-]{20,})\b/,
@@ -13,162 +13,482 @@ const SECRET_DETECTION_PATTERNS: readonly RegExp[] = [
   /\b(AIza[0-9A-Za-z-_]{35})\b/,
   /\b(xox[baprs]-[0-9a-zA-Z]{10,})\b/,
   /\b(sk_live_[0-9a-zA-Z]{24,})\b/,
+  /\b(npm_[a-zA-Z0-9]{36})\b/,
+  /(?:AccountKey|SharedAccessSignature)=([a-zA-Z0-9+/=]{20,})/i,
+  /\b(SK[0-9a-fA-F]{32})\b/,
+  /\b(ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/,
+  /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/,
+  /(?:postgres|postgresql|mysql|mongodb|mongodb\+srv|redis|amqp|mssql):\/\/[^:\s]+:([^@\s]+)@/i,
   /\bBearer\s+([a-zA-Z0-9_\-\.]{20,})\b/i,
+  /\bBasic\s+([a-zA-Z0-9+/=]{16,})\b/i,
 ];
+
+const SENSITIVE_KEY_NAME_REGEX =
+  /(?:api[_-]?key|secret|token|auth|password|passwd|credential|private[_-]?key|access[_-]?key)/i;
 
 export interface FixPlanItem {
   readonly serverName: string;
-  readonly key: string;
+  readonly jsonPath: (string | number)[];
+  readonly originalKey: string;
+  readonly targetEnvKey: string;
+  readonly key?: string;
   readonly rawValue: string;
+  readonly collisionDetected?: boolean;
+}
+
+export interface FixCollision {
+  readonly serverName: string;
+  readonly originalKey: string;
+  readonly generatedKey: string;
+  readonly existingValueMasked: string;
+  readonly newValueMasked: string;
 }
 
 export interface FixResult {
   readonly targetFile: string;
   readonly isDryRun: boolean;
   readonly plannedExtractions: readonly FixPlanItem[];
-  readonly backupFile?: string;
-  readonly envFile?: string;
+  readonly backupFile?: string | undefined;
+  readonly envBackupFile?: string | undefined;
+  readonly envFile?: string | undefined;
+  readonly collisions?: readonly FixCollision[] | undefined;
+  readonly rolledBack?: boolean | undefined;
 }
 
-function isSecretValue(val: string): boolean {
-  if (val.startsWith("${") && val.endsWith("}")) return false;
+export interface FixOptions {
+  readonly targetPath: string;
+  readonly isDryRun?: boolean | undefined;
+  readonly isJson?: boolean | undefined;
+  readonly yes?: boolean | undefined;
+  readonly envFile?: string | undefined;
+  readonly rollback?: string | undefined;
+}
+
+function isSecretValue(val: string, keyName?: string): boolean {
+  if (isSafePlaceholder(val)) return false;
   for (const pat of SECRET_DETECTION_PATTERNS) {
     if (pat.test(val)) return true;
   }
-  // Shannon entropy check for high entropy strings
-  if (val.length >= 24 && !val.includes(" ") && !val.includes("/") && !val.includes("\\")) {
-    return true;
+  // Contextual check: sensitive key name and non-trivial string
+  if (keyName && SENSITIVE_KEY_NAME_REGEX.test(keyName) && val.length >= 16) {
+    // Exclude filesystem paths
+    if (
+      !val.startsWith("/") &&
+      !val.startsWith("./") &&
+      !val.startsWith("../") &&
+      !/^[a-zA-Z]:[\\/]/.test(val)
+    ) {
+      return true;
+    }
   }
   return false;
 }
 
-export function executeSafeFix(targetFilePath: string, isDryRun: boolean = false): FixResult {
-  const resolvedPath = path.resolve(targetFilePath);
+function parseEnvFile(content: string): {
+  lines: string[];
+  keyMap: Map<string, string>;
+} {
+  const lines = content.split(/\r?\n/);
+  const keyMap = new Map<string, string>();
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIdx = line.indexOf("=");
+    if (eqIdx !== -1) {
+      const k = line.slice(0, eqIdx).trim();
+      let v = line.slice(eqIdx + 1).trim();
+      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+        v = v.slice(1, -1);
+      }
+      keyMap.set(k, v);
+    }
+  }
+
+  return { lines, keyMap };
+}
+
+function formatEnvValue(val: string): string {
+  if (val.includes("\0")) {
+    throw new Error("Secret value contains forbidden null byte");
+  }
+  const escaped = val.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+  if (val.includes(" ") || val.includes('"') || val.includes("'") || val.includes("\n") || val.includes("=")) {
+    return `"${escaped}"`;
+  }
+  return val;
+}
+
+export function executeRollback(backupPath: string): FixResult {
+  const resolvedBackup = path.resolve(backupPath);
+  if (!fs.existsSync(resolvedBackup)) {
+    throw new Error(`Backup file not found: ${backupPath}`);
+  }
+
+  let targetConfig = resolvedBackup;
+  if (resolvedBackup.endsWith(".bak")) {
+    targetConfig = resolvedBackup.slice(0, -4);
+    // Handle timestamped pattern: file.json.2026-11-25T...bak
+    const match = /(.*)\.\d{4}-\d{2}-\d{2}T[^\.]+\.bak$/.exec(resolvedBackup);
+    if (match && match[1]) {
+      targetConfig = match[1];
+    }
+  }
+
+  const backupContent = fs.readFileSync(resolvedBackup, "utf-8");
+  fs.writeFileSync(targetConfig, backupContent, "utf-8");
+
+  // Check if matching .env.mcp backup exists
+  const targetDir = path.dirname(targetConfig);
+  let envBackupFound: string | undefined;
+  const envFile = path.join(targetDir, ".env.mcp");
+
+  // Look for .env.mcp.<timestamp>.bak
+  try {
+    const entries = fs.readdirSync(targetDir);
+    const envBaks = entries
+      .filter((e) => e.startsWith(".env.mcp") && e.endsWith(".bak"))
+      .sort()
+      .reverse();
+    if (envBaks.length > 0 && envBaks[0]) {
+      envBackupFound = path.join(targetDir, envBaks[0]);
+      const envContent = fs.readFileSync(envBackupFound, "utf-8");
+      fs.writeFileSync(envFile, envContent, { mode: 0o600, encoding: "utf-8" });
+    }
+  } catch {}
+
+  return {
+    targetFile: targetConfig,
+    isDryRun: false,
+    plannedExtractions: [],
+    backupFile: resolvedBackup,
+    envBackupFile: envBackupFound,
+    rolledBack: true,
+  };
+}
+
+export function executeSafeFix(
+  targetPathOrOptions: string | FixOptions,
+  isDryRun: boolean = false,
+  extraOptions?: Partial<FixOptions>
+): FixResult {
+  const options: FixOptions =
+    typeof targetPathOrOptions === "string"
+      ? {
+          targetPath: targetPathOrOptions,
+          isDryRun,
+          ...extraOptions,
+        }
+      : targetPathOrOptions;
+  if (options.rollback) {
+    return executeRollback(options.rollback);
+  }
+
+  const resolvedPath = path.resolve(options.targetPath);
   if (!fs.existsSync(resolvedPath)) {
-    throw new Error(`Target configuration file not found: ${targetFilePath}`);
+    throw new Error(`Target configuration file not found: ${options.targetPath}`);
+  }
+
+  // Refuse symlinks
+  const lstat = fs.lstatSync(resolvedPath);
+  if (lstat.isSymbolicLink()) {
+    throw new Error(`Refusing to modify symbolic link: ${resolvedPath}`);
   }
 
   const rawContent = fs.readFileSync(resolvedPath, "utf-8");
-  const parsed = parseJsonc(rawContent, undefined, { allowTrailingComma: true });
+  const rootNode = parseTree(rawContent, undefined, { allowTrailingComma: true });
 
-  if (!parsed || typeof parsed !== "object") {
+  if (!rootNode || rootNode.type !== "object") {
     throw new Error(`Could not parse JSON in target configuration: ${resolvedPath}`);
   }
 
-  const record = parsed as Record<string, unknown>;
-  let serversBlock: Record<string, unknown> | undefined;
-
-  if (record["mcpServers"] && typeof record["mcpServers"] === "object") {
-    serversBlock = record["mcpServers"] as Record<string, unknown>;
-  } else if (record["servers"] && typeof record["servers"] === "object") {
-    serversBlock = record["servers"] as Record<string, unknown>;
-  } else if (record["context_servers"] && typeof record["context_servers"] === "object") {
-    serversBlock = record["context_servers"] as Record<string, unknown>;
+  // Identify servers block location: mcpServers, servers, or context_servers
+  let serversKey = "mcpServers";
+  let serversNode = findNodeAtLocation(rootNode, ["mcpServers"]);
+  if (!serversNode) {
+    serversNode = findNodeAtLocation(rootNode, ["servers"]);
+    if (serversNode) serversKey = "servers";
+  }
+  if (!serversNode) {
+    serversNode = findNodeAtLocation(rootNode, ["context_servers"]);
+    if (serversNode) serversKey = "context_servers";
   }
 
-  if (!serversBlock) {
+  if (!serversNode || serversNode.type !== "object" || !serversNode.children) {
     return {
       targetFile: resolvedPath,
-      isDryRun,
+      isDryRun: Boolean(options.isDryRun),
       plannedExtractions: [],
     };
   }
 
+  // Target .env.mcp file
+  const targetDir = path.dirname(resolvedPath);
+  const envFile = options.envFile ? path.resolve(options.envFile) : path.join(targetDir, ".env.mcp");
+
+  // Read existing .env.mcp if present
+  let existingEnvContent = "";
+  let existingKeyMap = new Map<string, string>();
+  if (fs.existsSync(envFile)) {
+    // Check symlink on env file
+    if (fs.lstatSync(envFile).isSymbolicLink()) {
+      throw new Error(`Refusing to write to symbolic link env file: ${envFile}`);
+    }
+    existingEnvContent = fs.readFileSync(envFile, "utf-8");
+    const parsedEnv = parseEnvFile(existingEnvContent);
+    existingKeyMap = parsedEnv.keyMap;
+  }
+
   const plannedExtractions: FixPlanItem[] = [];
+  const collisions: FixCollision[] = [];
+  const allocatedKeys = new Map<string, string>(existingKeyMap);
 
-  for (const [serverName, serverVal] of Object.entries(serversBlock)) {
-    if (!serverVal || typeof serverVal !== "object") continue;
-    const s = serverVal as { env?: Record<string, unknown> };
-    if (!s.env || typeof s.env !== "object") continue;
+  for (const serverProp of serversNode.children) {
+    if (serverProp.type !== "property" || !serverProp.children || serverProp.children.length < 2) continue;
+    const serverNameNode = serverProp.children[0];
+    const serverObjNode = serverProp.children[1];
+    if (!serverNameNode || !serverObjNode || serverObjNode.type !== "object") continue;
 
-    for (const [k, v] of Object.entries(s.env)) {
-      if (typeof v === "string" && isSecretValue(v)) {
-        plannedExtractions.push({
-          serverName,
-          key: k,
-          rawValue: v,
-        });
+    const serverName = String(serverNameNode.value);
+
+    // 1. Inspect env property
+    const envProp = serverObjNode.children?.find(
+      (c) => c.children?.[0]?.value === "env" && c.children[1]?.type === "object"
+    );
+
+    if (envProp && envProp.children && envProp.children[1]) {
+      const envObjNode = envProp.children[1];
+      if (envObjNode.children) {
+        for (const kvProp of envObjNode.children) {
+          if (kvProp.type !== "property" || !kvProp.children || kvProp.children.length < 2) continue;
+          const kNode = kvProp.children[0];
+          const vNode = kvProp.children[1];
+          if (!kNode || !vNode || vNode.type !== "string") continue;
+
+          const key = String(kNode.value);
+          const rawVal = String(vNode.value);
+
+          if (isSecretValue(rawVal, key)) {
+            let targetEnvKey = key;
+            let collisionDetected = false;
+
+            // Check if key already exists in .env.mcp
+            if (allocatedKeys.has(key)) {
+              const existingVal = allocatedKeys.get(key)!;
+              if (existingVal !== rawVal) {
+                // Collision!
+                collisionDetected = true;
+                const cleanServer = serverName.toUpperCase().replace(/[^A-Z0-9_]/g, "_");
+                let candidate = `${cleanServer}_${key}`;
+                let counter = 1;
+                while (allocatedKeys.has(candidate) && allocatedKeys.get(candidate) !== rawVal) {
+                  candidate = `${cleanServer}_${key}_${counter}`;
+                  counter++;
+                }
+                targetEnvKey = candidate;
+                collisions.push({
+                  serverName,
+                  originalKey: key,
+                  generatedKey: candidate,
+                  existingValueMasked: maskSecret(existingVal),
+                  newValueMasked: maskSecret(rawVal),
+                });
+              }
+            }
+
+            allocatedKeys.set(targetEnvKey, rawVal);
+
+            plannedExtractions.push({
+              serverName,
+              jsonPath: [serversKey, serverName, "env", key],
+              originalKey: key,
+              targetEnvKey,
+              key: targetEnvKey,
+              rawValue: rawVal,
+              collisionDetected,
+            });
+          }
+        }
       }
     }
   }
 
   if (plannedExtractions.length === 0) {
+    if (options.isJson) {
+      process.stdout.write(
+        JSON.stringify(
+          {
+            targetFile: resolvedPath,
+            isDryRun: Boolean(options.isDryRun),
+            plannedExtractions: [],
+            collisions: [],
+            message: "No unextracted secrets found in configuration.",
+          },
+          null,
+          2
+        ) + "\n"
+      );
+    } else {
+      console.log(pc.green("\n✓ No unextracted secrets detected in target configuration."));
+    }
     return {
       targetFile: resolvedPath,
-      isDryRun,
+      isDryRun: Boolean(options.isDryRun),
       plannedExtractions: [],
+      collisions: [],
     };
   }
 
-  if (isDryRun) {
-    console.log(pc.bold(pc.cyan("\n=== mcp-shield Safe Fix Plan (Dry Run) ===")));
-    console.log(pc.gray(`Target: ${resolvedPath}\n`));
-    for (const item of plannedExtractions) {
-      console.log(
-        `  ${pc.yellow("•")} Server "${item.serverName}": Extract ${pc.bold(item.key)}=${maskSecret(item.rawValue)} -> \${${item.key}}`
+  // Handle dry-run output
+  if (options.isDryRun) {
+    if (options.isJson) {
+      process.stdout.write(
+        JSON.stringify(
+          {
+            targetFile: resolvedPath,
+            isDryRun: true,
+            plannedExtractions,
+            collisions,
+          },
+          null,
+          2
+        ) + "\n"
       );
+    } else {
+      console.log(pc.bold(pc.cyan("\n=== mcp-shield Safe Fix Plan (Dry Run) ===")));
+      console.log(pc.gray(`Target: ${resolvedPath}\n`));
+      for (const item of plannedExtractions) {
+        const collisionNotice = item.collisionDetected
+          ? pc.yellow(` [Collision: auto-renamed to ${item.targetEnvKey}]`)
+          : "";
+        console.log(
+          `  ${pc.yellow("•")} Server "${item.serverName}": Extract ${pc.bold(item.originalKey)}=${maskSecret(item.rawValue)} -> \${${item.targetEnvKey}}${collisionNotice}`
+        );
+      }
+      if (collisions.length > 0) {
+        console.log(pc.yellow(`\nNotice: ${collisions.length} key collisions detected and resolved with server prefixes.`));
+      }
+      console.log(pc.dim("\nDry run active. No files were modified on disk.\n"));
     }
-    console.log(pc.dim("\nDry run active. No files were modified on disk.\n"));
     return {
       targetFile: resolvedPath,
       isDryRun: true,
       plannedExtractions,
+      collisions,
     };
   }
 
-  // 1. Create timestamped backup file
+  // 1. Create backups
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const backupFile = `${resolvedPath}.${timestamp}.bak`;
-  fs.writeFileSync(backupFile, rawContent, "utf-8");
+  const configBackupFile = `${resolvedPath}.${timestamp}.bak`;
+  fs.writeFileSync(configBackupFile, rawContent, "utf-8");
 
-  // 2. Write or append to .env.mcp in target file directory
-  const targetDir = path.dirname(resolvedPath);
-  const envFile = path.join(targetDir, ".env.mcp");
-
-  let existingEnvContent = "";
+  let envBackupFile: string | undefined;
   if (fs.existsSync(envFile)) {
-    existingEnvContent = fs.readFileSync(envFile, "utf-8");
+    envBackupFile = `${envFile}.${timestamp}.bak`;
+    fs.writeFileSync(envBackupFile, existingEnvContent, "utf-8");
   }
 
-  const newEnvLines: string[] = [];
-  for (const item of plannedExtractions) {
-    const keyAssignment = `${item.key}=${item.rawValue}`;
-    if (!existingEnvContent.includes(item.key + "=")) {
-      newEnvLines.push(keyAssignment);
-    }
-  }
-
-  if (newEnvLines.length > 0) {
-    const appendText = (existingEnvContent && !existingEnvContent.endsWith("\n") ? "\n" : "") +
-      newEnvLines.join("\n") +
-      "\n";
-    fs.writeFileSync(envFile, existingEnvContent + appendText, {
-      mode: 0o600,
-      encoding: "utf-8",
-    });
-  }
-
-  // 3. Replace inline secrets with ${VAR} references in target config
+  // 2. Perform structure-preserving JSONC edit
   let updatedContent = rawContent;
   for (const item of plannedExtractions) {
-    // Replace the exact quoted raw secret value with "${KEY}"
-    const targetPattern = JSON.stringify(item.rawValue);
-    const replacement = JSON.stringify(`\${${item.key}}`);
-    updatedContent = updatedContent.replaceAll(targetPattern, replacement);
+    const edits = modify(updatedContent, item.jsonPath, `\${${item.targetEnvKey}}`, {
+      formattingOptions: { insertSpaces: true, tabSize: 2 },
+    });
+    updatedContent = applyEdits(updatedContent, edits);
   }
 
-  fs.writeFileSync(resolvedPath, updatedContent, "utf-8");
+  // 3. Format and update .env.mcp content
+  const newEnvLines: string[] = [];
+  const writtenKeys = new Set<string>();
 
-  console.log(pc.bold(pc.green("\n✓ mcp-shield Safe Fix Completed Successfully")));
-  console.log(`  Target:  ${resolvedPath}`);
-  console.log(`  Backup:  ${backupFile}`);
-  console.log(`  Secrets: ${envFile} (mode: 0o600)\n`);
+  for (const item of plannedExtractions) {
+    if (writtenKeys.has(item.targetEnvKey)) continue;
+    // Only append if not already in existing file with same value
+    if (existingKeyMap.get(item.targetEnvKey) === item.rawValue) continue;
+
+    const formatted = `${item.targetEnvKey}=${formatEnvValue(item.rawValue)}`;
+    newEnvLines.push(formatted);
+    writtenKeys.add(item.targetEnvKey);
+  }
+
+  let finalEnvContent = existingEnvContent;
+  if (newEnvLines.length > 0) {
+    const separator = finalEnvContent && !finalEnvContent.endsWith("\n") ? "\n" : "";
+    finalEnvContent = finalEnvContent + separator + newEnvLines.join("\n") + "\n";
+  }
+
+  // 4. Atomic file write via temp files
+  const tmpConfig = `${resolvedPath}.tmp.${Date.now()}`;
+  const tmpEnv = `${envFile}.tmp.${Date.now()}`;
+
+  try {
+    fs.writeFileSync(tmpConfig, updatedContent, "utf-8");
+    fs.writeFileSync(tmpEnv, finalEnvContent, {
+      mode: process.platform === "win32" ? undefined : 0o600,
+      encoding: "utf-8",
+    });
+
+    // Atomic renames
+    fs.renameSync(tmpConfig, resolvedPath);
+    fs.renameSync(tmpEnv, envFile);
+
+    if (process.platform !== "win32") {
+      try {
+        fs.chmodSync(envFile, 0o600);
+      } catch {}
+    }
+  } catch (err) {
+    // Rollback on partial failure
+    try {
+      if (fs.existsSync(tmpConfig)) fs.unlinkSync(tmpConfig);
+      if (fs.existsSync(tmpEnv)) fs.unlinkSync(tmpEnv);
+      if (fs.existsSync(configBackupFile)) {
+        fs.writeFileSync(resolvedPath, rawContent, "utf-8");
+      }
+      if (envBackupFile && fs.existsSync(envBackupFile)) {
+        fs.writeFileSync(envFile, existingEnvContent, "utf-8");
+      }
+    } catch {}
+    throw new Error(`Atomic write failed: ${(err as Error).message}. Rolled back to original files.`);
+  }
+
+  if (options.isJson) {
+    process.stdout.write(
+      JSON.stringify(
+        {
+          targetFile: resolvedPath,
+          isDryRun: false,
+          plannedExtractions,
+          backupFile: configBackupFile,
+          envBackupFile,
+          envFile,
+          collisions,
+        },
+        null,
+        2
+      ) + "\n"
+    );
+  } else {
+    console.log(pc.bold(pc.green("\n✓ mcp-shield Safe Fix Completed Successfully")));
+    console.log(`  Target:  ${resolvedPath}`);
+    console.log(`  Backup:  ${configBackupFile}`);
+    console.log(`  Secrets: ${envFile} (mode: 0o600)`);
+    if (collisions.length > 0) {
+      console.log(
+        pc.yellow(`  Notice:  ${collisions.length} key collisions resolved with server prefixes.`)
+      );
+    }
+    console.log();
+  }
 
   return {
     targetFile: resolvedPath,
     isDryRun: false,
     plannedExtractions,
-    backupFile,
+    backupFile: configBackupFile,
+    envBackupFile,
     envFile,
+    collisions,
   };
 }

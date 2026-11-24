@@ -1,13 +1,55 @@
 import * as path from "node:path";
 import * as os from "node:os";
 import * as fs from "node:fs";
-import * as crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type {
   JsonRpcRequest,
   ProxyDecision,
   PolicyConfig,
 } from "../types/index.js";
+import { JsonRpcErrorCode } from "../types/index.js";
+import * as crypto from "node:crypto";
+import { defaultRugPullManager, type ToolDefinition } from "./rugpull.js";
+
+export { defaultRugPullManager, type ToolDefinition };
+
+export class RugPullDetector {
+  private toolHashes = new Map<string, string>();
+
+  public computeToolHash(tool: ToolDefinition): string {
+    const raw = `${tool.name}:${tool.description || ""}:${JSON.stringify(tool.inputSchema || {})}`;
+    return crypto.createHash("sha256").update(raw).digest("hex");
+  }
+
+  public registerTools(tools: readonly ToolDefinition[]): {
+    hasMutation: boolean;
+    mutatedTool?: string;
+  } {
+    for (const tool of tools) {
+      if (!tool.name) continue;
+      const hash = this.computeToolHash(tool);
+      if (this.toolHashes.has(tool.name)) {
+        const prevHash = this.toolHashes.get(tool.name);
+        if (prevHash !== hash) {
+          return { hasMutation: true, mutatedTool: tool.name };
+        }
+      } else {
+        this.toolHashes.set(tool.name, hash);
+      }
+    }
+    return { hasMutation: false };
+  }
+
+  public hasTool(name: string): boolean {
+    return this.toolHashes.has(name);
+  }
+
+  public clear(): void {
+    this.toolHashes.clear();
+  }
+}
+
+export const defaultRugPullDetector = new RugPullDetector();
 
 const SENSITIVE_FILENAME_PATTERNS: readonly { readonly regex: RegExp; readonly name: string }[] = [
   { regex: /(?:^|[\\/])\.env(?:\..*)?$/i, name: ".env file" },
@@ -135,7 +177,6 @@ export function resolveCanonicalPath(rawPath: string): string {
 
   let resolved = absolute;
 
-  // If path exists on disk, resolve its real symlink target
   if (fs.existsSync(absolute)) {
     try {
       resolved = fs.realpathSync(absolute);
@@ -143,7 +184,6 @@ export function resolveCanonicalPath(rawPath: string): string {
       resolved = absolute;
     }
   } else {
-    // If file does not exist, resolve realpath of nearest parent directory
     let current = absolute;
     const childSegments: string[] = [];
 
@@ -186,53 +226,6 @@ export function tokenizeShellCommand(commandLine: string): string[] {
 }
 
 /**
- * Rug-pull detector tracking tool definitions across sessions.
- */
-export interface ToolDefinition {
-  readonly name: string;
-  readonly description?: string;
-  readonly inputSchema?: unknown;
-}
-
-export class RugPullDetector {
-  private toolHashes = new Map<string, string>();
-
-  public computeToolHash(tool: ToolDefinition): string {
-    const raw = `${tool.name}:${tool.description || ""}:${JSON.stringify(tool.inputSchema || {})}`;
-    return crypto.createHash("sha256").update(raw).digest("hex");
-  }
-
-  public registerTools(tools: readonly ToolDefinition[]): {
-    hasMutation: boolean;
-    mutatedTool?: string;
-  } {
-    for (const tool of tools) {
-      if (!tool.name) continue;
-      const hash = this.computeToolHash(tool);
-      if (this.toolHashes.has(tool.name)) {
-        const prevHash = this.toolHashes.get(tool.name);
-        if (prevHash !== hash) {
-          return { hasMutation: true, mutatedTool: tool.name };
-        }
-      } else {
-        this.toolHashes.set(tool.name, hash);
-      }
-    }
-    return { hasMutation: false };
-  }
-
-  public hasTool(name: string): boolean {
-    return this.toolHashes.has(name);
-  }
-
-  public clear(): void {
-    this.toolHashes.clear();
-  }
-}
-
-export const defaultRugPullDetector = new RugPullDetector();
-
-/**
  * Mask sensitive file target for log output.
  */
 function redactTarget(target: string): string {
@@ -246,16 +239,63 @@ function redactTarget(target: string): string {
   return `**/${base}`;
 }
 
+/**
+ * Check if a host represents an internal SSRF target (localhost, private network, link-local).
+ */
+export function isInternalOrPrivateHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().trim();
+
+  // Localhost aliases
+  if (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "0.0.0.0" ||
+    host === "::1" ||
+    host === "[::1]" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal")
+  ) {
+    return true;
+  }
+
+  // IPv4 Private ranges
+  // 10.0.0.0/8
+  if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  // 192.168.0.0/16
+  if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  // 172.16.0.0/12 (172.16.x.x - 172.31.x.x)
+  const match172 = /^172\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(host);
+  if (match172 && match172[1]) {
+    const octet = parseInt(match172[1], 10);
+    if (octet >= 16 && octet <= 31) return true;
+  }
+  // 169.254.0.0/16 (Link-local / Cloud metadata: 169.254.169.254)
+  if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+
+  // IPv6 link-local
+  if (host.startsWith("fe80:") || host.startsWith("[fe80:")) return true;
+
+  return false;
+}
+
 export interface StructuredToolArguments {
   paths: string[];
   commands: string[];
+  urls: string[];
+  toolNames: string[];
   rawStrings: string[];
 }
 
+/**
+ * Recursively walk request params to extract all paths, commands, URLs, and tool names.
+ */
 export function extractStructuredArguments(request: JsonRpcRequest): StructuredToolArguments {
   const result: StructuredToolArguments = {
     paths: [],
     commands: [],
+    urls: [],
+    toolNames: [],
     rawStrings: [],
   };
 
@@ -263,55 +303,65 @@ export function extractStructuredArguments(request: JsonRpcRequest): StructuredT
     return result;
   }
 
-  const params = request.params as Record<string, unknown>;
+  const pathKeyRegex = /(?:path|file|dir|uri|target|dest|source|folder|root)/i;
+  const cmdKeyRegex = /(?:command|cmd|script|exec|shell|binary|process|run)/i;
 
-  // Check resources/read
-  if (typeof params["uri"] === "string") {
-    result.paths.push(params["uri"]);
-  }
+  const urlRegex = /\b(?:https?|wss?|ftp):\/\/([a-zA-Z0-9_\-\.:]+)/gi;
 
-  // Check tools/call arguments
-  const args = params["arguments"];
-  if (args && typeof args === "object") {
-    const argsObj = args as Record<string, unknown>;
+  function walk(val: unknown, keyName?: string, depth: number = 0) {
+    if (depth > 32) return;
 
-    const pathKeys = ["path", "filePath", "dirPath", "target", "file", "uri", "destination", "source"];
-    for (const key of pathKeys) {
-      const val = argsObj[key];
-      if (typeof val === "string") {
-        result.paths.push(val);
-      } else if (Array.isArray(val)) {
-        for (const item of val) {
-          if (typeof item === "string") result.paths.push(item);
-        }
+    if (typeof val === "string") {
+      result.rawStrings.push(val);
+
+      // Check for URLs
+      let urlMatch: RegExpExecArray | null;
+      while ((urlMatch = urlRegex.exec(val)) !== null) {
+        if (urlMatch[1]) result.urls.push(urlMatch[1]);
       }
-    }
 
-    const cmdKeys = ["command", "cmd", "script", "exec"];
-    for (const key of cmdKeys) {
-      const val = argsObj[key];
-      if (typeof val === "string") {
+      // Check key name for paths or commands
+      if (keyName && pathKeyRegex.test(keyName)) {
+        result.paths.push(val);
+      } else if (
+        val.startsWith("./") ||
+        val.startsWith("../") ||
+        val.startsWith("/") ||
+        val.startsWith("~") ||
+        val.startsWith("file://") ||
+        /^[a-zA-Z]:[\\/]/.test(val) ||
+        isUncPath(val)
+      ) {
+        result.paths.push(val);
+      }
+
+      if (keyName && cmdKeyRegex.test(keyName)) {
         result.commands.push(val);
       }
-    }
 
-    for (const val of Object.values(argsObj)) {
-      if (typeof val === "string") {
-        result.rawStrings.push(val);
+      if (keyName === "name" && request.method === "tools/call") {
+        result.toolNames.push(val);
+      }
+    } else if (Array.isArray(val)) {
+      for (const item of val) {
+        walk(item, keyName, depth + 1);
+      }
+    } else if (val && typeof val === "object") {
+      for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+        walk(v, k, depth + 1);
       }
     }
-  } else {
-    // If no nested arguments block, walk all string values in params
-    function walk(val: unknown) {
-      if (typeof val === "string") {
-        result.rawStrings.push(val);
-      } else if (Array.isArray(val)) {
-        for (const item of val) walk(item);
-      } else if (val && typeof val === "object") {
-        for (const v of Object.values(val as Record<string, unknown>)) walk(v);
-      }
-    }
-    walk(params);
+  }
+
+  walk(request.params);
+
+  // Directly extract method-specific targets
+  const paramsRecord = request.params as Record<string, unknown>;
+  if (typeof paramsRecord["uri"] === "string") {
+    result.paths.push(paramsRecord["uri"]);
+  }
+  if (typeof paramsRecord["name"] === "string" && request.method === "tools/call") {
+    result.toolNames.push(paramsRecord["name"]);
   }
 
   return result;
@@ -325,21 +375,124 @@ export function evaluateRequest(
   policy?: PolicyConfig
 ): ProxyDecision {
   const method = request.method;
-  const inspectableMethods = new Set(["tools/call", "resources/read", "prompts/get"]);
 
-  if (!inspectableMethods.has(method)) {
-    return { action: "ALLOW" };
+  // 1. Blocked Methods Check
+  if (policy?.blockedMethods && policy.blockedMethods.length > 0) {
+    for (const blocked of policy.blockedMethods) {
+      if (method === blocked || (blocked.endsWith("*") && method.startsWith(blocked.slice(0, -1)))) {
+        return {
+          action: "BLOCK",
+          ruleId: "MS-007",
+          owaspId: "MCP07:2025",
+          reason: `Blocked by mcp-shield policy: Method "${method}" is forbidden by blockedMethods`,
+          redactedTarget: method,
+          errorCode: JsonRpcErrorCode.METHOD_NOT_FOUND,
+        };
+      }
+    }
   }
 
   const structured = extractStructuredArguments(request);
 
-  // 1. Inspect Shell Commands
-  const allCommands = Array.from(new Set([...structured.commands, ...structured.rawStrings]));
-  for (const rawCmd of allCommands) {
+  // 2. Tools Allowlist / Denylist Check (tools/call)
+  if (method === "tools/call") {
+    for (const toolName of structured.toolNames) {
+      if (policy?.deniedTools && policy.deniedTools.includes(toolName)) {
+        return {
+          action: "BLOCK",
+          ruleId: "MS-007",
+          owaspId: "MCP07:2025",
+          reason: `Blocked by mcp-shield policy: Tool "${toolName}" is forbidden by deniedTools`,
+          redactedTarget: toolName,
+          errorCode: JsonRpcErrorCode.POLICY_BLOCK,
+        };
+      }
+
+      if (policy?.allowedTools && policy.allowedTools.length > 0) {
+        if (!policy.allowedTools.includes(toolName)) {
+          return {
+            action: "BLOCK",
+            ruleId: "MS-007",
+            owaspId: "MCP07:2025",
+            reason: `Blocked by mcp-shield policy: Tool "${toolName}" is not on allowedTools list`,
+            redactedTarget: toolName,
+            errorCode: JsonRpcErrorCode.POLICY_BLOCK,
+          };
+        }
+      }
+    }
+  }
+
+  // 3. Hosts & SSRF Check
+  for (const hostWithPort of structured.urls) {
+    const hostname = hostWithPort.split(":")[0] || hostWithPort;
+
+    // Check deniedHosts in policy
+    if (policy?.deniedHosts && policy.deniedHosts.length > 0) {
+      for (const denied of policy.deniedHosts) {
+        if (hostname.toLowerCase() === denied.toLowerCase() || hostname.toLowerCase().endsWith(`.${denied.toLowerCase()}`)) {
+          return {
+            action: "BLOCK",
+            ruleId: "MS-006",
+            owaspId: "MCP06:2025",
+            reason: `Blocked by mcp-shield policy (MS-006): Access to host "${hostname}" forbidden by deniedHosts`,
+            redactedTarget: hostname,
+            errorCode: JsonRpcErrorCode.POLICY_BLOCK,
+          };
+        }
+      }
+    }
+
+    // SSRF private network check
+    if (isInternalOrPrivateHost(hostname)) {
+      // If allowedHosts explicitly allows it, allow; otherwise block SSRF
+      const explicitlyAllowed = policy?.allowedHosts?.some(
+        (h) => h.toLowerCase() === hostname.toLowerCase()
+      );
+      if (!explicitlyAllowed) {
+        return {
+          action: "BLOCK",
+          ruleId: "MS-006",
+          owaspId: "MCP06:2025",
+          reason: `Blocked by mcp-shield (MS-006): SSRF risk — request accesses private/internal network host "${hostname}"`,
+          redactedTarget: hostname,
+          errorCode: JsonRpcErrorCode.POLICY_BLOCK,
+        };
+      }
+    }
+
+    // AllowedHosts enforcement
+    if (policy?.allowedHosts && policy.allowedHosts.length > 0) {
+      const isAllowed = policy.allowedHosts.some(
+        (h) => hostname.toLowerCase() === h.toLowerCase() || hostname.toLowerCase().endsWith(`.${h.toLowerCase()}`)
+      );
+      if (!isAllowed) {
+        return {
+          action: "BLOCK",
+          ruleId: "MS-006",
+          owaspId: "MCP06:2025",
+          reason: `Blocked by mcp-shield policy (MS-006): Host "${hostname}" is not on allowedHosts list`,
+          redactedTarget: hostname,
+          errorCode: JsonRpcErrorCode.POLICY_BLOCK,
+        };
+      }
+    }
+  }
+
+  // 4. Shell Commands & Process Allowlist
+  const explicitCommands = structured.commands;
+  const allCandidateCommands = Array.from(new Set([...explicitCommands, ...structured.rawStrings]));
+
+  for (const rawCmd of allCandidateCommands) {
     const trimmed = rawCmd.trim();
     if (!trimmed) continue;
 
     for (const pat of DESTRUCTIVE_COMMAND_PATTERNS) {
+      // Check shell chaining metacharacters only on explicit command arguments
+      if (pat.name === "Unescaped shell command chaining" && !explicitCommands.includes(rawCmd)) {
+        continue;
+      }
+
       if (pat.regex.test(trimmed)) {
         return {
           action: "BLOCK",
@@ -347,6 +500,7 @@ export function evaluateRequest(
           owaspId: "MCP05:2025",
           reason: `Blocked by mcp-shield (MS-005): Dangerous shell pattern detected (${pat.name})`,
           redactedTarget: trimmed.slice(0, 40),
+          errorCode: JsonRpcErrorCode.POLICY_BLOCK,
         };
       }
     }
@@ -360,19 +514,38 @@ export function evaluateRequest(
             owaspId: "MCP05:2025",
             reason: `Blocked by mcp-shield policy: Command "${blockedCmd}" is forbidden by policy.yaml`,
             redactedTarget: blockedCmd,
+            errorCode: JsonRpcErrorCode.POLICY_BLOCK,
           };
         }
       }
     }
   }
 
-  // 2. Inspect File Paths
+  if (policy?.processAllowlist && policy.processAllowlist.length > 0) {
+    for (const rawCmd of explicitCommands) {
+      const trimmed = rawCmd.trim();
+      if (!trimmed) continue;
+      const tokens = tokenizeShellCommand(trimmed);
+      const binary = tokens[0] ? path.basename(tokens[0]) : "";
+      if (binary && !policy.processAllowlist.includes(binary)) {
+        return {
+          action: "BLOCK",
+          ruleId: "MS-005",
+          owaspId: "MCP05:2025",
+          reason: `Blocked by mcp-shield policy: Command binary "${binary}" is not in processAllowlist`,
+          redactedTarget: binary,
+          errorCode: JsonRpcErrorCode.POLICY_BLOCK,
+        };
+      }
+    }
+  }
+
+  // 5. File Paths & Sensitive Locations
   const allCandidatePaths = Array.from(new Set([...structured.paths, ...structured.rawStrings]));
   for (const rawPath of allCandidatePaths) {
     const trimmed = rawPath.trim();
     if (!trimmed) continue;
 
-    // Check Windows UNC paths
     if (isUncPath(trimmed)) {
       return {
         action: "BLOCK",
@@ -380,12 +553,12 @@ export function evaluateRequest(
         owaspId: "MCP02:2025",
         reason: `Blocked by mcp-shield (MS-002): Unauthorized Windows UNC network path detected`,
         redactedTarget: trimmed.slice(0, 30),
+        errorCode: JsonRpcErrorCode.POLICY_BLOCK,
       };
     }
 
     const decoded = decodePathEscapes(trimmed);
 
-    // Check decoded string against sensitive targets
     for (const pat of SENSITIVE_FILENAME_PATTERNS) {
       if (pat.regex.test(decoded)) {
         return {
@@ -394,11 +567,11 @@ export function evaluateRequest(
           owaspId: "MCP01:2025",
           reason: `Blocked by mcp-shield (MS-001): Unauthorized access to sensitive file (${pat.name})`,
           redactedTarget: redactTarget(decoded),
+          errorCode: JsonRpcErrorCode.POLICY_BLOCK,
         };
       }
     }
 
-    // Resolve canonical real path on disk
     const canonical = resolveCanonicalPath(decoded);
 
     for (const pat of SENSITIVE_FILENAME_PATTERNS) {
@@ -409,11 +582,11 @@ export function evaluateRequest(
           owaspId: "MCP01:2025",
           reason: `Blocked by mcp-shield (MS-001): Symlink or traversal access to sensitive target (${pat.name})`,
           redactedTarget: redactTarget(canonical),
+          errorCode: JsonRpcErrorCode.POLICY_BLOCK,
         };
       }
     }
 
-    // Custom policy denyPaths
     if (policy?.denyPaths) {
       for (const denyPattern of policy.denyPaths) {
         const cleanPattern = denyPattern.replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*");
@@ -425,6 +598,7 @@ export function evaluateRequest(
             owaspId: "MCP02:2025",
             reason: `Blocked by mcp-shield policy: Path matches denyPaths rule "${denyPattern}"`,
             redactedTarget: redactTarget(canonical),
+            errorCode: JsonRpcErrorCode.POLICY_BLOCK,
           };
         }
       }

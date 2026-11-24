@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { parse as parseJsonc, printParseErrorCode } from "jsonc-parser";
+import { parse as parseYaml } from "yaml";
 import type { NormalizedMcpServer, McpClientType, McpTransportType } from "../types/index.js";
 
 interface KnownLocation {
@@ -27,6 +28,11 @@ function getAppdataDir(): string {
     return path.join(os.homedir(), "Library", "Application Support");
   }
   return path.join(os.homedir(), ".config");
+}
+
+export function isBackupFile(filenameOrPath: string): boolean {
+  const base = path.basename(filenameOrPath);
+  return /\.bak(?:\.|$)/i.test(base);
 }
 
 export function getKnownLocations(): readonly KnownLocation[] {
@@ -136,8 +142,39 @@ export function getKnownLocations(): readonly KnownLocation[] {
     {
       client: "zed",
       scope: "global",
-      getPath: () => path.join(appdata, "zed", "settings.json"),
+      getPath: () => path.join(home, ".config", "zed", "settings.json"),
       serverKey: "context_servers",
+      urlKeys: ["url"],
+    },
+    // Cline
+    {
+      client: "cline",
+      scope: "global",
+      getPath: () =>
+        path.join(
+          appdata,
+          "Code",
+          "User",
+          "globalStorage",
+          "saoudrizwan.claude-dev",
+          "settings",
+          "cline_mcp_settings.json"
+        ),
+      serverKey: "mcpServers",
+      urlKeys: ["url"],
+    },
+    {
+      client: "cline",
+      scope: "workspace",
+      getPath: () => path.join(process.cwd(), ".cline", "mcp_settings.json"),
+      serverKey: "mcpServers",
+      urlKeys: ["url"],
+    },
+    {
+      client: "cline",
+      scope: "workspace",
+      getPath: () => path.join(process.cwd(), "cline_mcp_settings.json"),
+      serverKey: "mcpServers",
       urlKeys: ["url"],
     },
   ];
@@ -154,12 +191,163 @@ interface RawServerConfig {
   readonly type?: unknown;
 }
 
+export function expandEnvVars(text: string): string {
+  return text.replace(/\$\{([A-Za-z0-9_]+)\}|\$([A-Za-z0-9_]+)/g, (match, p1, p2) => {
+    const varName = p1 || p2;
+    if (varName && process.env[varName] !== undefined) {
+      return process.env[varName]!;
+    }
+    return match;
+  });
+}
+
+export function parseSimpleToml(content: string): Record<string, unknown> {
+  const root: Record<string, any> = {};
+  let current = root;
+  const lines = content.split(/\r?\n/);
+
+  for (let line of lines) {
+    line = line.trim();
+    if (!line || line.startsWith("#")) continue;
+
+    // Table header [a.b.c]
+    const headerMatch = line.match(/^\[([A-Za-z0-9_.\-]+)\]$/);
+    const tablePath = headerMatch ? headerMatch[1] : undefined;
+    if (tablePath) {
+      const parts = tablePath.split(".");
+      current = root;
+      for (const part of parts) {
+        if (!current[part] || typeof current[part] !== "object") {
+          current[part] = {};
+        }
+        current = current[part];
+      }
+      continue;
+    }
+
+    // Key-value pair
+    const eqIdx = line.indexOf("=");
+    if (eqIdx !== -1) {
+      const rawKey = line.slice(0, eqIdx).trim();
+      const rawVal = line.slice(eqIdx + 1).trim();
+      const key = rawKey.replace(/^["']|["']$/g, "");
+      current[key] = parseTomlValue(rawVal);
+    }
+  }
+
+  return root;
+}
+
+function parseTomlValue(val: string): unknown {
+  const v = val.trim();
+  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+    return v.slice(1, -1);
+  }
+  if (v === "true") return true;
+  if (v === "false") return false;
+  if (/^-?\d+$/.test(v)) return parseInt(v, 10);
+  if (/^-?\d+\.\d+$/.test(v)) return parseFloat(v);
+  if (v.startsWith("[") && v.endsWith("]")) {
+    const inner = v.slice(1, -1).trim();
+    if (!inner) return [];
+    const items: string[] = [];
+    let cur = "";
+    let inQuote = false;
+    let quoteChar = "";
+    for (let i = 0; i < inner.length; i++) {
+      const ch = inner[i];
+      const prevCh = i > 0 ? inner[i - 1] : undefined;
+      if ((ch === '"' || ch === "'") && prevCh !== "\\") {
+        if (!inQuote) {
+          inQuote = true;
+          quoteChar = ch;
+        } else if (quoteChar === ch) {
+          inQuote = false;
+        }
+      }
+      if (ch === "," && !inQuote) {
+        items.push(cur.trim());
+        cur = "";
+      } else {
+        cur += ch;
+      }
+    }
+    if (cur.trim()) items.push(cur.trim());
+    return items.map((item) => parseTomlValue(item));
+  }
+  return v;
+}
+
+export function parseConfigContent(
+  content: string,
+  filePath: string
+): Record<string, unknown> | undefined {
+  const ext = path.extname(filePath).toLowerCase();
+
+  if (ext === ".yaml" || ext === ".yml") {
+    try {
+      const parsed = parseYaml(content);
+      if (parsed && typeof parsed === "object") {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      return undefined;
+    }
+  }
+
+  if (ext === ".toml") {
+    try {
+      const parsed = parseSimpleToml(content);
+      if (parsed && typeof parsed === "object") {
+        return parsed;
+      }
+    } catch {
+      return undefined;
+    }
+  }
+
+  // Try JSON / JSONC
+  const errors: { error: number; offset: number; length: number }[] = [];
+  const parsed = parseJsonc(content, errors, { allowTrailingComma: true });
+  if (errors.length === 0 && parsed && typeof parsed === "object") {
+    return parsed as Record<string, unknown>;
+  }
+
+  // Fallback 1: YAML parser handles many non-strict formats
+  try {
+    const yamlParsed = parseYaml(content);
+    if (yamlParsed && typeof yamlParsed === "object") {
+      return yamlParsed as Record<string, unknown>;
+    }
+  } catch {}
+
+  // Fallback 2: TOML parser
+  try {
+    const tomlParsed = parseSimpleToml(content);
+    if (tomlParsed && Object.keys(tomlParsed).length > 0) {
+      return tomlParsed;
+    }
+  } catch {}
+
+  return undefined;
+}
+
 export function parseConfigFile(
   filePath: string,
   client: McpClientType = "custom"
 ): NormalizedMcpServer[] {
   const resolvedPath = path.resolve(expandHome(filePath));
   if (!fs.existsSync(resolvedPath)) {
+    return [];
+  }
+
+  try {
+    const stat = fs.lstatSync(resolvedPath);
+    if (stat.size > 5 * 1024 * 1024) {
+      process.stderr.write(`Warning: Config file ${resolvedPath} exceeds 5 MB limit. Skipping.\n`);
+      return [];
+    }
+  } catch {
     return [];
   }
 
@@ -170,16 +358,7 @@ export function parseConfigFile(
     return [];
   }
 
-  const errors: { error: number; offset: number; length: number }[] = [];
-  const parsed = parseJsonc(content, errors, { allowTrailingComma: true });
-
-  if (errors.length > 0 && parsed === undefined) {
-    const firstErr = errors[0];
-    const codeMsg = firstErr ? printParseErrorCode(firstErr.error) : "Unknown JSON error";
-    process.stderr.write(`Warning: Failed to parse JSONC at ${resolvedPath}: ${codeMsg}\n`);
-    return [];
-  }
-
+  const parsed = parseConfigContent(content, resolvedPath);
   if (!parsed || typeof parsed !== "object") {
     return [];
   }
@@ -200,14 +379,32 @@ export function parseConfigFile(
   }
 
   const results: NormalizedMcpServer[] = [];
+  const configDir = path.dirname(resolvedPath);
 
   for (const [serverName, rawServer] of Object.entries(serversBlock)) {
     if (!rawServer || typeof rawServer !== "object") continue;
 
     const s = rawServer as RawServerConfig;
-    const command = typeof s.command === "string" ? s.command : undefined;
+    let command = typeof s.command === "string" ? s.command : undefined;
+    if (command) {
+      command = expandEnvVars(command);
+      if (
+        command.startsWith("./") ||
+        command.startsWith("../") ||
+        command.startsWith(".\\") ||
+        command.startsWith("..\\")
+      ) {
+        command = path.resolve(configDir, command);
+      }
+    }
+
     const args = Array.isArray(s.args)
-      ? s.args.filter((a): a is string => typeof a === "string")
+      ? s.args
+          .filter((a): a is string => typeof a === "string")
+          .map((a) => {
+            const expanded = expandEnvVars(a);
+            return expanded;
+          })
       : undefined;
 
     let env: Record<string, string> | undefined;
@@ -222,11 +419,13 @@ export function parseConfigFile(
       }
     }
 
-    const urlCandidate =
+    const rawUrlCandidate =
       (typeof s.url === "string" && s.url) ||
       (typeof s.serverUrl === "string" && s.serverUrl) ||
       (typeof s.httpUrl === "string" && s.httpUrl) ||
       undefined;
+
+    const urlCandidate = rawUrlCandidate ? expandEnvVars(rawUrlCandidate) : undefined;
 
     let headers: Record<string, string> | undefined;
     if (s.headers && typeof s.headers === "object") {
@@ -252,11 +451,11 @@ export function parseConfigFile(
       configPath: resolvedPath,
       serverName,
       transport,
-      command,
-      args,
-      env,
-      url: urlCandidate,
-      headers,
+      ...(command !== undefined ? { command } : {}),
+      ...(args !== undefined ? { args } : {}),
+      ...(env !== undefined ? { env } : {}),
+      ...(urlCandidate !== undefined ? { url: urlCandidate } : {}),
+      ...(headers !== undefined ? { headers } : {}),
     });
   }
 
@@ -278,7 +477,6 @@ export function discoverConfigs(customPath?: string): {
         scannedFiles.add(resolved);
         servers.push(...parseConfigFile(resolved, "custom"));
       } else if (stat.isDirectory()) {
-        // Search directory for standard config names
         const candidateNames = [
           "mcp.json",
           "mcp_config.json",
@@ -286,20 +484,31 @@ export function discoverConfigs(customPath?: string): {
           ".cursor/mcp.json",
           ".vscode/mcp.json",
           ".agents/mcp_config.json",
+          "cline_mcp_settings.json",
+          ".cline/mcp_settings.json",
+          "mcp.yaml",
+          "mcp.yml",
+          "mcp.toml",
         ];
         for (const rel of candidateNames) {
           const target = path.join(resolved, rel);
           if (fs.existsSync(target) && fs.statSync(target).isFile()) {
-            scannedFiles.add(target);
-            servers.push(...parseConfigFile(target, "custom"));
+            if (!isBackupFile(target)) {
+              scannedFiles.add(target);
+              servers.push(...parseConfigFile(target, "custom"));
+            }
           }
         }
-        // Also look for any .json files in root of the custom directory if none found
         if (scannedFiles.size === 0) {
           try {
             const entries = fs.readdirSync(resolved, { withFileTypes: true });
+            const validExts = [".json", ".jsonc", ".yaml", ".yml", ".toml"];
             for (const entry of entries) {
-              if (entry.isFile() && entry.name.endsWith(".json")) {
+              if (
+                entry.isFile() &&
+                validExts.some((ext) => entry.name.endsWith(ext)) &&
+                !isBackupFile(entry.name)
+              ) {
                 const target = path.join(resolved, entry.name);
                 const parsed = parseConfigFile(target, "custom");
                 if (parsed.length > 0) {
@@ -319,7 +528,7 @@ export function discoverConfigs(customPath?: string): {
   for (const loc of getKnownLocations()) {
     try {
       const p = loc.getPath();
-      if (fs.existsSync(p)) {
+      if (fs.existsSync(p) && !isBackupFile(p)) {
         scannedFiles.add(p);
         servers.push(...parseConfigFile(p, loc.client));
       }

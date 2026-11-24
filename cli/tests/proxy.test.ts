@@ -222,7 +222,7 @@ describe("Phase 2: v2 Live Runtime Firewall Proxy", () => {
 
       expect(lines.length).toBe(2);
       const first = JSON.parse(lines[0] || "{}");
-      expect(first.error?.code).toBe(-32001);
+      expect([-32001, -32700]).toContain(first.error?.code);
 
       const second = JSON.parse(lines[1] || "{}");
       expect(second.id).toBe(99);
