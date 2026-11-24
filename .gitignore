@@ -37,3 +37,8 @@ TESTING.MD
 # Operating system files
 .DS_Store
 Thumbs.db
+
+# Strictly publish README.md only
+*.md
+*.MD
+!README.md
