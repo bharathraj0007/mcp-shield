@@ -35,18 +35,32 @@ function sendToProxyProcess(requests: readonly (string | object)[]): Promise<Pro
 
     proxyProc.on("error", reject);
 
+    let isFinished = false;
+    const finish = () => {
+      if (!isFinished) {
+        isFinished = true;
+        resolve({ stdout: stdoutData, stderr: stderrData });
+      }
+    };
+
+    proxyProc.on("close", finish);
+
     for (const req of requests) {
       const line = typeof req === "string" ? req : JSON.stringify(req);
       proxyProc.stdin.write(line + "\n");
     }
 
     setTimeout(() => {
-      proxyProc.stdin.end();
-      proxyProc.kill("SIGTERM");
+      try {
+        proxyProc.stdin.end();
+      } catch {}
       setTimeout(() => {
-        resolve({ stdout: stdoutData, stderr: stderrData });
-      }, 400);
-    }, 1000);
+        try {
+          proxyProc.kill("SIGTERM");
+        } catch {}
+        setTimeout(finish, 500);
+      }, 600);
+    }, 1500);
   });
 }
 

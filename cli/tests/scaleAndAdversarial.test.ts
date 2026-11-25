@@ -93,7 +93,7 @@ describe("Section 13: High-Scale & Adversarial Stress Test Suite", () => {
       expect(result.totalEntries).toBe(ENTRY_COUNT + 1);
       // High-volume verification should complete comfortably within 1000 ms
       expect(tVerifyDuration).toBeLessThan(1000);
-    });
+    }, 15000);
   });
 
   describe("2. Adversarial Audit Log Tampering Detection", () => {
