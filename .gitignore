@@ -6,6 +6,9 @@ node_modules/
 dist/
 build/
 *.tsbuildinfo
+*.tgz
+sbom.cdx.json
+SHA256SUMS.txt
 
 # Sensitive files & local secret extractions
 .env
@@ -38,7 +41,12 @@ TESTING.MD
 .DS_Store
 Thumbs.db
 
-# Strictly publish README.md only
+# Tracked open-source documentation
 *.md
 *.MD
 !README.md
+!THREAT_MODEL.md
+!SECURITY.md
+!CONTRIBUTING.md
+!CODE_OF_CONDUCT.md
+!CHANGELOG.md

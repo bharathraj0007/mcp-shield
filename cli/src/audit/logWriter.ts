@@ -69,6 +69,185 @@ export function computeHmacSignature(entryHash: string, hmacKey: string): string
   return crypto.createHmac("sha256", hmacKey).update(entryHash).digest("hex");
 }
 
+export function generateAuditKeyPair(outDir?: string): {
+  privateKeyPath: string;
+  publicKeyPath: string;
+  keyId: string;
+} {
+  const targetDir = path.resolve(outDir || process.cwd());
+  fs.mkdirSync(targetDir, { recursive: true });
+
+  const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519", {
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+
+  const keyId = crypto.createHash("sha256").update(publicKey).digest("hex").slice(0, 16);
+
+  const privateKeyPath = path.join(targetDir, "audit-signing.key");
+  const publicKeyPath = path.join(targetDir, "audit-signing.pub");
+
+  fs.writeFileSync(privateKeyPath, privateKey, {
+    mode: process.platform === "win32" ? undefined : 0o600,
+    encoding: "utf-8",
+  });
+
+  fs.writeFileSync(publicKeyPath, publicKey, {
+    mode: process.platform === "win32" ? undefined : 0o644,
+    encoding: "utf-8",
+  });
+
+  return { privateKeyPath, publicKeyPath, keyId };
+}
+
+export function signCheckpointPayload(
+  payload: { eventCount: number; headHash: string; keyId: string; sequence: number },
+  privateKeyPem: string
+): string {
+  const canonical = canonicalJsonStringify(payload);
+  return crypto.sign(null, Buffer.from(canonical), privateKeyPem).toString("base64");
+}
+
+export function verifyCheckpointPayload(
+  payload: { eventCount: number; headHash: string; keyId: string; sequence: number },
+  signatureBase64: string,
+  publicKeyPem: string
+): boolean {
+  try {
+    const canonical = canonicalJsonStringify(payload);
+    return crypto.verify(
+      null,
+      Buffer.from(canonical),
+      publicKeyPem,
+      Buffer.from(signatureBase64, "base64")
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function createAuditCheckpoint(options?: {
+  logPath?: string | undefined;
+  privateKeyPath?: string | undefined;
+  privateKeyContent?: string | undefined;
+}): AuditLogEntry {
+  const logPath = options?.logPath || getDefaultAuditLogPath();
+  const dir = path.dirname(logPath);
+
+  fs.mkdirSync(dir, {
+    recursive: true,
+    mode: process.platform === "win32" ? undefined : 0o700,
+  });
+
+  // Resolve private key content
+  let privateKeyPem: string;
+  if (options?.privateKeyContent) {
+    privateKeyPem = options.privateKeyContent;
+  } else {
+    const keyPath =
+      options?.privateKeyPath ||
+      process.env.MCP_SHIELD_AUDIT_PRIVATE_KEY ||
+      path.join(process.cwd(), "audit-signing.key");
+
+    let content: string;
+    try {
+      content = fs.readFileSync(path.resolve(keyPath), "utf-8");
+    } catch {
+      throw new Error(`Audit signing private key not found at: ${keyPath}`);
+    }
+    privateKeyPem = content;
+  }
+
+  // Derive public key and deterministic keyId
+  const privKeyObj = crypto.createPrivateKey(privateKeyPem);
+  const pubKeyObj = crypto.createPublicKey(privKeyObj);
+  const pubKeyPem = pubKeyObj.export({ type: "spki", format: "pem" }).toString();
+  const keyId = crypto.createHash("sha256").update(pubKeyPem).digest("hex").slice(0, 16);
+
+  // Read current log state
+  let prevHash = GENESIS_PREV_HASH;
+  let seq = 1;
+  let eventCount = 0;
+
+  try {
+    const lines = fs
+      .readFileSync(logPath, "utf-8")
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+
+    if (lines.length > 0) {
+      eventCount = lines.length;
+      const lastLine = lines[lines.length - 1];
+      if (lastLine) {
+        const parsed = JSON.parse(lastLine) as AuditLogEntry;
+        if (parsed.entryHash) {
+          prevHash = parsed.entryHash;
+        }
+        if (typeof parsed.seq === "number") {
+          seq = parsed.seq + 1;
+        } else {
+          seq = lines.length + 1;
+        }
+      }
+    }
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "EPERM" && code !== "EACCES") {
+      throw err;
+    }
+  }
+
+  const headHash = prevHash;
+  const sequence = seq;
+
+  const checkpointPayload = {
+    eventCount,
+    headHash,
+    keyId,
+    sequence,
+  };
+
+  const signature = signCheckpointPayload(checkpointPayload, privateKeyPem);
+
+  const baseEntry = {
+    schemaVersion: 1,
+    seq,
+    timestamp: new Date().toISOString(),
+    eventType: "checkpoint" as const,
+    action: "CHECKPOINT" as const,
+    details: checkpointPayload,
+    prevHash,
+  };
+
+  const entryHash = computeCanonicalEntryHash(prevHash, baseEntry);
+
+  const checkpointEntry: AuditLogEntry = {
+    ...baseEntry,
+    entryHash,
+    signature,
+    keyId,
+    headHash,
+    eventCount,
+    sequence,
+  };
+
+  const lineToWrite = canonicalJsonStringify(checkpointEntry) + "\n";
+  fs.appendFileSync(logPath, lineToWrite, {
+    mode: process.platform === "win32" ? undefined : 0o600,
+    encoding: "utf-8",
+  });
+
+  if (process.platform !== "win32") {
+    try {
+      fs.chmodSync(dir, 0o700);
+      fs.chmodSync(logPath, 0o600);
+    } catch {}
+  }
+
+  return checkpointEntry;
+}
+
 export function appendAuditEntry(
   entry: {
     eventType: "scan" | "proxy";
@@ -210,7 +389,8 @@ export interface AuditVerifyResult {
 export function verifyAuditLog(
   customLogPath?: string,
   expectedTotalRecords?: number,
-  hmacKey?: string
+  hmacKey?: string,
+  publicKeyPathOrContent?: string
 ): AuditVerifyResult {
   const logPath = customLogPath || getDefaultAuditLogPath();
   const dir = path.dirname(logPath);
@@ -286,6 +466,34 @@ export function verifyAuditLog(
     };
   }
 
+  // Resolve Ed25519 public key if specified or available
+  let publicKeyPem: string | undefined;
+  if (publicKeyPathOrContent) {
+    if (publicKeyPathOrContent.includes("BEGIN PUBLIC KEY")) {
+      publicKeyPem = publicKeyPathOrContent;
+    } else {
+      try {
+        publicKeyPem = fs.readFileSync(path.resolve(publicKeyPathOrContent), "utf-8");
+      } catch {
+        return {
+          valid: false,
+          totalEntries: 0,
+          code: "INVALID_SIGNATURE",
+          errorReason: `Public key file not found: ${publicKeyPathOrContent}`,
+        };
+      }
+    }
+  } else if (process.env.MCP_SHIELD_AUDIT_PUBLIC_KEY) {
+    const envKey = process.env.MCP_SHIELD_AUDIT_PUBLIC_KEY;
+    if (envKey.includes("BEGIN PUBLIC KEY")) {
+      publicKeyPem = envKey;
+    } else {
+      try {
+        publicKeyPem = fs.readFileSync(path.resolve(envKey), "utf-8");
+      } catch {}
+    }
+  }
+
   let expectedPrevHash = GENESIS_PREV_HASH;
   const activeHmacKey = hmacKey || process.env.MCP_SHIELD_AUDIT_HMAC_KEY;
 
@@ -351,8 +559,74 @@ export function verifyAuditLog(
       };
     }
 
+    // Verify checkpoint integrity if checkpoint entry
+    const isCheckpoint = parsed.eventType === "checkpoint" || parsed.action === "CHECKPOINT";
+    if (isCheckpoint) {
+      const headHash =
+        parsed.headHash ?? (parsed.details?.["headHash"] as string | undefined);
+      const eventCount =
+        parsed.eventCount ?? (parsed.details?.["eventCount"] as number | undefined);
+      const keyId =
+        parsed.keyId ?? (parsed.details?.["keyId"] as string | undefined);
+      const sequence =
+        parsed.sequence ??
+        (parsed.details?.["sequence"] as number | undefined) ??
+        parsed.seq;
+
+      if (headHash && headHash !== expectedPrevHash) {
+        return {
+          valid: false,
+          totalEntries: lines.length,
+          code: "CHECKPOINT_MISMATCH",
+          errorLine: i + 1,
+          errorReason: `Checkpoint mismatch at line ${i + 1}: headHash does not match actual log head`,
+        };
+      }
+
+      if (eventCount !== undefined && eventCount !== i) {
+        return {
+          valid: false,
+          totalEntries: lines.length,
+          code: "CHECKPOINT_MISMATCH",
+          errorLine: i + 1,
+          errorReason: `Checkpoint mismatch at line ${i + 1}: eventCount ${eventCount} does not match actual event count ${i}`,
+        };
+      }
+
+      if (publicKeyPem) {
+        if (!parsed.signature) {
+          return {
+            valid: false,
+            totalEntries: lines.length,
+            code: "INVALID_SIGNATURE",
+            errorLine: i + 1,
+            errorReason: `Missing Ed25519 signature on checkpoint at line ${i + 1}`,
+          };
+        }
+        const isValid = verifyCheckpointPayload(
+          {
+            eventCount: eventCount ?? i,
+            headHash: headHash ?? expectedPrevHash,
+            keyId: keyId ?? "",
+            sequence,
+          },
+          parsed.signature,
+          publicKeyPem
+        );
+        if (!isValid) {
+          return {
+            valid: false,
+            totalEntries: lines.length,
+            code: "INVALID_SIGNATURE",
+            errorLine: i + 1,
+            errorReason: `Invalid Ed25519 signature on checkpoint at line ${i + 1}`,
+          };
+        }
+      }
+    }
+
     // Verify HMAC signature if active
-    if (activeHmacKey) {
+    if (activeHmacKey && !isCheckpoint) {
       if (!parsed.signature) {
         return {
           valid: false,
@@ -426,9 +700,45 @@ export function printAuditTerminalReport(options: {
   isJson?: boolean | undefined;
   hmacKey?: string | undefined;
   exportPath?: string | undefined;
+  checkpoint?: boolean | undefined;
+  privateKey?: string | undefined;
+  publicKey?: string | undefined;
 }): boolean {
   const logPath = getDefaultAuditLogPath();
   const tailCount = options.tailCount ?? 20;
+
+  if (options.checkpoint) {
+    try {
+      const entry = createAuditCheckpoint({
+        logPath,
+        privateKeyPath: options.privateKey,
+      });
+
+      if (options.isJson) {
+        process.stdout.write(JSON.stringify(entry, null, 2) + "\n");
+      } else {
+        console.log(
+          pc.bold(
+            pc.green(`\n✓ Cryptographic Audit Checkpoint Created (Seq #${entry.seq})`)
+          )
+        );
+        console.log(`  Key ID:     ${pc.cyan(entry.keyId || "")}`);
+        console.log(`  Head Hash:  ${pc.dim(entry.headHash || "")}`);
+        console.log(`  Events:     ${entry.eventCount}`);
+        console.log(`  Entry Hash: ${pc.dim(entry.entryHash)}\n`);
+      }
+      return true;
+    } catch (err) {
+      if (options.isJson) {
+        process.stdout.write(
+          JSON.stringify({ error: (err as Error).message, success: false }) + "\n"
+        );
+      } else {
+        process.stderr.write(pc.red(`Checkpoint error: ${(err as Error).message}\n`));
+      }
+      return false;
+    }
+  }
 
   if (options.exportPath) {
     try {
@@ -453,7 +763,12 @@ export function printAuditTerminalReport(options: {
     }
   }
 
-  const verifyResult = verifyAuditLog(logPath, undefined, options.hmacKey);
+  const verifyResult = verifyAuditLog(
+    logPath,
+    undefined,
+    options.hmacKey,
+    options.publicKey
+  );
 
   if (options.isJson) {
     const payload = {
@@ -501,7 +816,9 @@ export function printAuditTerminalReport(options: {
 
   for (const entry of entries) {
     const badge =
-      entry.action === "BLOCK"
+      entry.action === "CHECKPOINT"
+        ? pc.bgMagenta(pc.white(" CHECKPOINT "))
+        : entry.action === "BLOCK"
         ? pc.bgRed(pc.white(" BLOCK "))
         : entry.action === "ALLOW"
         ? pc.green(" ALLOW ")
@@ -510,9 +827,15 @@ export function printAuditTerminalReport(options: {
     console.log(
       `#${entry.seq} ${pc.dim(entry.timestamp)} ${badge} ${pc.bold(entry.eventType.toUpperCase())} ${entry.ruleId ? pc.yellow(entry.ruleId) : ""}`
     );
-    console.log(
-      `  Hash: ${pc.dim(entry.entryHash.slice(0, 16))}... <- Prev: ${pc.dim(entry.prevHash.slice(0, 16))}...`
-    );
+    if (entry.action === "CHECKPOINT") {
+      console.log(
+        `  Key ID: ${pc.cyan(entry.keyId || "")} | Events: ${entry.eventCount} | Head: ${pc.dim((entry.headHash || "").slice(0, 16))}...`
+      );
+    } else {
+      console.log(
+        `  Hash: ${pc.dim(entry.entryHash.slice(0, 16))}... <- Prev: ${pc.dim(entry.prevHash.slice(0, 16))}...`
+      );
+    }
   }
   console.log();
   return true;

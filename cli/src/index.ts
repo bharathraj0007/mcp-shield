@@ -19,6 +19,10 @@ import {
   appendAuditEntry,
   printAuditTerminalReport,
   verifyAuditLog,
+  generateAuditKeyPair,
+  createAuditCheckpoint,
+  signCheckpointPayload,
+  verifyCheckpointPayload,
 } from "./audit/logWriter.js";
 import { generateSarifReport } from "./audit/sarif.js";
 import { loadBaseline, filterWithBaseline, updateBaseline } from "./scanner/baseline.js";
@@ -413,10 +417,13 @@ program
     }
   );
 
-program
+const auditCmd = program
   .command("audit")
-  .description("Inspect or verify tamper-evident audit log")
-  .option("--verify", "Verify SHA-256 hash chain integrity")
+  .description("Inspect, verify, or sign tamper-evident audit log")
+  .option("--verify", "Verify SHA-256 hash chain and Ed25519 checkpoint integrity")
+  .option("--checkpoint", "Append a signed Ed25519 cryptographic checkpoint")
+  .option("--private-key <file>", "Ed25519 private key path for signing checkpoints")
+  .option("--public-key <file>", "Ed25519 public key path for verifying checkpoints")
   .option("--json", "Output audit report or verification status in JSON format")
   .option("--hmac-key <key>", "HMAC-SHA-256 secret key to sign or verify entries")
   .option("--export <file>", "Export verified audit log to specified file path")
@@ -424,6 +431,9 @@ program
   .action(
     (options?: {
       verify?: boolean;
+      checkpoint?: boolean;
+      privateKey?: string;
+      publicKey?: string;
       json?: boolean;
       hmacKey?: string;
       export?: string;
@@ -437,6 +447,9 @@ program
           hmacKey: options?.hmacKey,
           exportPath: options?.export,
           tailCount: tailNum,
+          checkpoint: Boolean(options?.checkpoint),
+          privateKey: options?.privateKey,
+          publicKey: options?.publicKey,
         });
 
         if (!ok) {
@@ -450,6 +463,29 @@ program
       }
     }
   );
+
+auditCmd
+  .command("keygen")
+  .description("Generate an Ed25519 signing keypair for audit checkpoints")
+  .option("--out <dir>", "Output directory for key files", ".")
+  .option("--json", "Output key generation result in JSON format")
+  .action((options?: { out?: string; json?: boolean }) => {
+    try {
+      const res = generateAuditKeyPair(options?.out);
+      if (options?.json) {
+        process.stdout.write(JSON.stringify(res, null, 2) + "\n");
+      } else {
+        console.log(pc.bold(pc.green("\n✓ Generated Ed25519 audit signing keypair")));
+        console.log(`  Private key: ${pc.cyan(res.privateKeyPath)} (mode: 0o600)`);
+        console.log(`  Public key:  ${pc.cyan(res.publicKeyPath)} (mode: 0o644)`);
+        console.log(`  Key ID:      ${pc.yellow(res.keyId)}\n`);
+      }
+      process.exitCode = ExitCode.SUCCESS;
+    } catch (err) {
+      process.stderr.write(pc.red(`Keygen error: ${(err as Error).message}\n`));
+      process.exitCode = ExitCode.INTERNAL_ERROR;
+    }
+  });
 
 program
   .command("rules")
@@ -572,6 +608,10 @@ export {
   getPolicyJsonSchema,
   executeSafeFix,
   verifyAuditLog,
+  generateAuditKeyPair,
+  createAuditCheckpoint,
+  signCheckpointPayload,
+  verifyCheckpointPayload,
   generateSarifReport,
   generateCompletions,
   RULE_DEFINITIONS,

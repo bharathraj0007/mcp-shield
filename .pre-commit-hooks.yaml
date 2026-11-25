@@ -1,0 +1,7 @@
+- id: mcp-shield-scan
+  name: mcp-shield-scan
+  description: Scan MCP configurations for hardcoded secrets, unsafe command arguments, and path traversal vulnerabilities
+  entry: mcp-shield scan . --ci
+  language: node
+  files: (\.json|\.jsonc|\.yaml|\.yml|\.toml)$
+  pass_filenames: false

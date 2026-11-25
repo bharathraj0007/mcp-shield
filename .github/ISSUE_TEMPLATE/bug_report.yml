@@ -1,61 +1,42 @@
 name: Bug Report
-description: Report a bug, crash, or unexpected behavior in mcp-shield
+description: Report a reproducible defect, bypass, or unexpected behavior in mcp-shield
 title: "[BUG]: "
-labels: ["bug"]
+labels: ["bug", "triage"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thank you for reporting a bug. Please ensure no sensitive credentials or API keys are included in your issue.
-  - type: input
-    id: version
-    attributes:
-      label: mcp-shield Version
-      description: Run `mcp-shield --version`
-      placeholder: "0.1.0"
-    validations:
-      required: true
-  - type: input
-    id: node-version
-    attributes:
-      label: Node.js Version
-      description: Run `node --version`
-      placeholder: "v20.11.0"
-    validations:
-      required: true
-  - type: dropdown
-    id: os
-    attributes:
-      label: Operating System
-      options:
-        - macOS (Apple Silicon)
-        - macOS (Intel)
-        - Linux (Ubuntu/Debian)
-        - Linux (Fedora/RHEL/Arch)
-        - Windows 10/11
-    validations:
-      required: true
+        Thank you for reporting an issue! Please ensure sensitive credentials and API keys are redacted before submitting.
+        If this is a critical security vulnerability, please report privately via [Security Advisories](https://github.com/bharathraj0007/mcp-shield/security/advisories/new).
   - type: textarea
     id: description
     attributes:
-      label: Bug Description
-      description: Clear and concise description of the bug.
+      label: Description
+      description: Concise description of the defect or unexpected behavior.
     validations:
       required: true
   - type: textarea
     id: reproduction
     attributes:
       label: Steps to Reproduce
-      description: Steps or command lines to reproduce the issue.
+      description: Exact commands, MCP configuration snippet, or JSON-RPC payload to reproduce the issue.
       placeholder: |
-        1. Run 'mcp-shield scan ...'
-        2. Observe error output
+        1. Run 'mcp-shield scan ./mcp.json'
+        2. Observe error ...
     validations:
       required: true
   - type: textarea
     id: expected
     attributes:
       label: Expected Behavior
-      description: What should happen instead.
+      description: What should have happened instead.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment Details
+      description: Operating System, Node.js version, and mcp-shield version.
+      placeholder: Windows 11 / macOS 14 / Ubuntu 22.04, Node.js v20.11.0, mcp-shield v1.0.0
     validations:
       required: true

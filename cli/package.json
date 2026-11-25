@@ -1,6 +1,6 @@
 {
   "name": "@bharathraj_07/mcp-shield",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "description": "100% offline local AI agent security scanner, runtime firewall, and YAML policy engine",
   "type": "module",
   "bin": {
@@ -21,7 +21,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "bench": "vitest run tests/corpus.test.ts tests/benchmark.test.ts",
-    "self-test": "npm run build && node scripts/agent-self-test.mjs"
+    "self-test": "npm run build && node scripts/agent-self-test.mjs",
+    "release:artifacts": "node scripts/release-artifacts.mjs"
   },
   "keywords": [
     "mcp",

@@ -33,8 +33,10 @@ The tool operates **100% offline**. It sends no network telemetry, makes zero ou
 7. [Exit Codes Reference](#7-exit-codes-reference)
 8. [Programmatic TypeScript Library API](#8-programmatic-typescript-library-api)
 9. [GitHub Actions SARIF Integration](#9-github-actions-sarif-integration)
-10. [Benchmarks & Detection Coverage](#10-benchmarks--detection-coverage)
-11. [License](#11-license)
+10. [Pre-Commit Hook Integration](#10-pre-commit-hook-integration)
+11. [Benchmarks & Detection Coverage](#11-benchmarks--detection-coverage)
+12. [Governance & Documentation](#12-governance--documentation)
+13. [License](#13-license)
 
 ---
 
@@ -331,6 +333,9 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file"
 
 ## 3. System Architecture & Threat Model
 
+> [!NOTE]
+> For detailed trust boundaries, attacker capabilities, covered attack vectors, and non-goals, see [THREAT_MODEL.md](THREAT_MODEL.md).
+
 ### System Architecture
 
 `mcp-shield` combines three defense layers into a single lightweight binary:
@@ -515,12 +520,17 @@ mcp-shield proxy "--" npx -y @modelcontextprotocol/server-filesystem ./workspace
 ### `mcp-shield audit [options]`
 
 #### Description & How It Works
-`audit` reads the local cryptographically chained audit log (`~/.mcp-shield/audit.jsonl`). Each scan and proxy action computes a SHA-256 hash over the current record combined with the previous entry's hash (`prevHash`). When invoked with `--verify`, it confirms that zero records were edited, removed, or truncated.
+`audit` manages the local cryptographically chained audit log (`~/.mcp-shield/audit.jsonl`). Each scan and proxy action computes a SHA-256 hash over the current record combined with the previous entry's hash (`prevHash`).
+
+In addition to SHA-256 hash chaining, `mcp-shield` supports **Ed25519 digital signature checkpoints**. You can generate an asymmetric keypair via `mcp-shield audit keygen`, append signed checkpoints with `--checkpoint`, and verify complete chain and signature integrity via `--verify --public-key <file>`.
 
 #### Flags & Options
 | Flag | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--verify` | Flag | `false` | Validates cryptographic SHA-256 hash chain and sequence continuity. |
+| `--verify` | Flag | `false` | Validates cryptographic SHA-256 hash chain and Ed25519 checkpoint integrity. |
+| `--checkpoint` | Flag | `false` | Appends a signed Ed25519 cryptographic checkpoint to the audit log. |
+| `--private-key <file>` | Option | `undefined` | Path to Ed25519 private key for checkpoint signing. |
+| `--public-key <file>` | Option | `undefined` | Path to Ed25519 public key for checkpoint signature verification. |
 | `--json` | Flag | `false` | Output audit report or verification status in JSON format. |
 | `--hmac-key <key>` | Option | `undefined` | HMAC-SHA-256 secret key to sign or verify entries. |
 | `--export <file>` | Option | `undefined` | Export verified audit log to specified file path. |
@@ -528,14 +538,20 @@ mcp-shield proxy "--" npx -y @modelcontextprotocol/server-filesystem ./workspace
 
 #### Step-by-Step Examples
 ```bash
-# View recent audit events
+# 1. View recent audit events
 mcp-shield audit
 
-# Verify SHA-256 hash chain integrity
+# 2. Verify SHA-256 hash chain integrity
 mcp-shield audit --verify
 
-# Verify using an HMAC key
-mcp-shield audit --verify --hmac-key my-signing-secret
+# 3. Generate Ed25519 keypair for offline checkpoint signing
+mcp-shield audit keygen --out ./keys
+
+# 4. Append a signed cryptographic checkpoint to the log
+mcp-shield audit --checkpoint --private-key ./keys/audit-signing.key
+
+# 5. Verify both hash chain and Ed25519 checkpoint signatures
+mcp-shield audit --verify --public-key ./keys/audit-signing.pub
 ```
 
 ---
@@ -803,18 +819,36 @@ jobs:
 
 ---
 
-## 10. Benchmarks & Detection Coverage
+## 10. Pre-Commit Hook Integration
+
+You can configure `mcp-shield` as a [pre-commit](https://pre-commit.com/) hook to automatically scan MCP configuration files before every commit.
+
+Add the following to your repository's `.pre-commit-config.yaml`:
+
+```yaml
+repos:
+  - repo: https://github.com/bharathraj0007/mcp-shield
+    rev: v1.0.0
+    hooks:
+      - id: mcp-shield-scan
+```
+
+Alternatively, run `mcp-shield scan . --ci` directly inside any git pre-commit script.
+
+---
+
+## 11. Benchmarks & Detection Coverage
 
 `mcp-shield` passes an automated verification corpus with **104 security test cases**:
 - **Malicious Attack Coverage:** 100% detection rate across 63 attack vectors (path traversal, symlink escapes, UNC paths, command injection, secret leakage, rug-pull mutations).
 - **False-Positive Target:** 0% false positives across 41 benign workspace operations.
-- **Latency Overhead:** < 5.0 ms p99 per JSON-RPC message (benchmarked under 0.1 ms average).
+- **Latency Overhead:** < 5.0 ms p99 per JSON-RPC message (benchmarked under 0.15 ms average).
 
 ### Reproduce Benchmarks Locally
 ```bash
 git clone https://github.com/bharathraj0007/mcp-shield.git
 cd mcp-shield/cli
-npm install
+npm ci
 npm run bench
 ```
 
@@ -823,16 +857,26 @@ Sample Benchmark Output:
 ==================================================
 MCP-SHIELD PROXY LATENCY BENCHMARK RESULTS (500 runs)
 ==================================================
-  Average: 0.0169 ms
-  p50:     0.0149 ms
-  p90:     0.0362 ms
-  p95:     0.0420 ms
-  p99:     0.0596 ms (Target: < 5.0 ms)
+  Average: 0.0330 ms
+  p50:     0.0274 ms
+  p90:     0.0776 ms
+  p95:     0.0908 ms
+  p99:     0.1154 ms (Target: < 5.0 ms)
 ==================================================
 ```
 
 ---
 
-## 11. License
+## 12. Governance & Documentation
+
+- [Threat Model & Boundary Analysis](THREAT_MODEL.md): In-depth attacker profiles, covered attack vectors, and non-goals.
+- [Security Policy](SECURITY.md): Supported versions, 100% offline guarantee, and vulnerability disclosure procedures.
+- [Contributing Guide](CONTRIBUTING.md): Local development setup, testing standards, and pull request guidelines.
+- [Code of Conduct](CODE_OF_CONDUCT.md): Community standards and pledge.
+- [Changelog](CHANGELOG.md): Complete release history.
+
+---
+
+## 13. License
 
 Apache-2.0

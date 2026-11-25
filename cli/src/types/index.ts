@@ -207,6 +207,7 @@ export type AuditVerificationCode =
   | "REORDERED_ENTRY"
   | "TRUNCATED_ENTRY"
   | "INVALID_SIGNATURE"
+  | "CHECKPOINT_MISMATCH"
   | "SYMLINK_DETECTED"
   | "CORRUPT_JSON";
 
@@ -214,14 +215,18 @@ export interface AuditLogEntry {
   readonly schemaVersion?: number;
   readonly seq: number;
   readonly timestamp: string;
-  readonly eventType: "scan" | "proxy";
-  readonly action: "SCAN_COMPLETE" | "ALLOW" | "BLOCK";
+  readonly eventType: "scan" | "proxy" | "checkpoint";
+  readonly action: "SCAN_COMPLETE" | "ALLOW" | "BLOCK" | "CHECKPOINT";
   readonly ruleId?: string | undefined;
   readonly owaspId?: string | undefined;
   readonly details: Readonly<Record<string, unknown>>;
   readonly prevHash: string;
   readonly entryHash: string;
   readonly signature?: string;
+  readonly keyId?: string;
+  readonly headHash?: string;
+  readonly eventCount?: number;
+  readonly sequence?: number;
 }
 
 export interface BaselineFinding {

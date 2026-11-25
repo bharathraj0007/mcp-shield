@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build-and-release:
+    name: Build & Publish Release Artifacts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+          cache-dependency-path: cli/package-lock.json
+
+      - name: Install Dependencies
+        working-directory: cli
+        run: npm ci
+
+      - name: Compile CLI Bundle
+        working-directory: cli
+        run: npm run build
+
+      - name: Run Test Suites
+        working-directory: cli
+        run: npm test
+
+      - name: Run Security Benchmarks
+        working-directory: cli
+        run: npm run bench
+
+      - name: Run Black-Box Self-Test Harness
+        working-directory: cli
+        run: npm run self-test
+
+      - name: Generate Release Tarball, SBOM & Checksums
+        working-directory: cli
+        run: npm run release:artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            cli/*.tgz
+            cli/sbom.cdx.json
+            cli/SHA256SUMS.txt
