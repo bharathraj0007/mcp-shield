@@ -289,49 +289,70 @@ export function appendAuditEntry(
     if ((err as Error).message.startsWith("SYMLINK_DETECTED")) throw err;
   }
 
-  // 2. Check file symlink
-  try {
-    const fStat = fs.lstatSync(logPath);
-    if (fStat.isSymbolicLink()) {
-      throw new Error("SYMLINK_DETECTED: Audit log file cannot be a symbolic link");
-    }
-  } catch (err) {
-    if ((err as Error).message.startsWith("SYMLINK_DETECTED")) throw err;
-    // File does not exist yet, which is safe
-  }
-
+  // 2. Open log file safely via file descriptor to eliminate TOCTOU races
   let prevHash = GENESIS_PREV_HASH;
   let seq = 1;
+  const noFollowFlag = fs.constants.O_NOFOLLOW ?? 0;
+  let readFd: number | undefined;
 
   try {
-    const lines = fs
-      .readFileSync(logPath, "utf-8")
-      .trim()
-      .split("\n")
-      .filter(Boolean);
-
-    if (lines.length > 0) {
-      const lastLine = lines[lines.length - 1];
-      if (lastLine) {
+    try {
+      readFd = fs.openSync(logPath, fs.constants.O_RDONLY | noFollowFlag);
+    } catch (openErr: unknown) {
+      const code = (openErr as NodeJS.ErrnoException).code;
+      if (code === "ELOOP") {
+        throw new Error("SYMLINK_DETECTED: Audit log file cannot be a symbolic link");
+      }
+      if (code === "EINVAL" && noFollowFlag !== 0) {
+        // Fallback for Windows if O_NOFOLLOW is unsupported
         try {
-          const parsed = JSON.parse(lastLine) as AuditLogEntry;
-          if (parsed.entryHash) {
-            prevHash = parsed.entryHash;
+          readFd = fs.openSync(logPath, fs.constants.O_RDONLY);
+        } catch (winErr: unknown) {
+          const wCode = (winErr as NodeJS.ErrnoException).code;
+          if (wCode !== "ENOENT" && wCode !== "EPERM" && wCode !== "EACCES") {
+            throw winErr;
           }
-          if (typeof parsed.seq === "number") {
-            seq = parsed.seq + 1;
-          } else {
-            seq = lines.length + 1;
+        }
+      } else if (code !== "ENOENT" && code !== "EPERM" && code !== "EACCES") {
+        throw openErr;
+      }
+    }
+
+    if (readFd !== undefined) {
+      const stat = fs.fstatSync(readFd);
+      if (!stat.isFile()) {
+        throw new Error("SYMLINK_DETECTED: Audit log file cannot be a symbolic link");
+      }
+      const rawContent = fs.readFileSync(readFd, "utf-8");
+      const lines = rawContent
+        .trim()
+        .split("\n")
+        .filter(Boolean);
+
+      if (lines.length > 0) {
+        const lastLine = lines[lines.length - 1];
+        if (lastLine) {
+          try {
+            const parsed = JSON.parse(lastLine) as AuditLogEntry;
+            if (parsed.entryHash) {
+              prevHash = parsed.entryHash;
+            }
+            if (typeof parsed.seq === "number") {
+              seq = parsed.seq + 1;
+            } else {
+              seq = lines.length + 1;
+            }
+          } catch {
+            // Fall back to genesis if last line was corrupt
           }
-        } catch {
-          // Fall back to genesis if last line was corrupt
         }
       }
     }
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code !== "ENOENT" && code !== "EPERM" && code !== "EACCES") {
-      throw err;
+  } finally {
+    if (readFd !== undefined) {
+      try {
+        fs.closeSync(readFd);
+      } catch {}
     }
   }
 
@@ -410,8 +431,59 @@ export function verifyAuditLog(
     if (code !== "ENOENT" && code !== "EPERM" && code !== "EACCES") throw err;
   }
 
+  const noFollowFlag = fs.constants.O_NOFOLLOW ?? 0;
+  let fd: number | undefined;
+  let content: string;
+
   try {
-    if (fs.lstatSync(logPath).isSymbolicLink()) {
+    try {
+      fd = fs.openSync(logPath, fs.constants.O_RDONLY | noFollowFlag);
+    } catch (openErr: unknown) {
+      const code = (openErr as NodeJS.ErrnoException).code;
+      if (code === "ELOOP") {
+        return {
+          valid: false,
+          totalEntries: 0,
+          code: "SYMLINK_DETECTED",
+          errorReason: "Audit log file is a symbolic link",
+        };
+      }
+      if (code === "EINVAL" && noFollowFlag !== 0) {
+        // Fallback for Windows if O_NOFOLLOW is unsupported
+        try {
+          fd = fs.openSync(logPath, fs.constants.O_RDONLY);
+        } catch (fallbackErr: unknown) {
+          const fbCode = (fallbackErr as NodeJS.ErrnoException).code;
+          if (fbCode === "ENOENT" || fbCode === "EPERM" || fbCode === "EACCES") {
+            if (expectedTotalRecords && expectedTotalRecords > 0) {
+              return {
+                valid: false,
+                totalEntries: 0,
+                code: "MISSING_LOG",
+                errorReason: `Audit log file is missing; expected ${expectedTotalRecords} records`,
+              };
+            }
+            return { valid: true, totalEntries: 0, code: "SUCCESS" };
+          }
+          throw fallbackErr;
+        }
+      } else if (code === "ENOENT" || code === "EPERM" || code === "EACCES") {
+        if (expectedTotalRecords && expectedTotalRecords > 0) {
+          return {
+            valid: false,
+            totalEntries: 0,
+            code: "MISSING_LOG",
+            errorReason: `Audit log file is missing; expected ${expectedTotalRecords} records`,
+          };
+        }
+        return { valid: true, totalEntries: 0, code: "SUCCESS" };
+      } else {
+        throw openErr;
+      }
+    }
+
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) {
       return {
         valid: false,
         totalEntries: 0,
@@ -419,28 +491,13 @@ export function verifyAuditLog(
         errorReason: "Audit log file is a symbolic link",
       };
     }
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code !== "ENOENT" && code !== "EPERM" && code !== "EACCES") throw err;
-  }
-
-  let content: string;
-  try {
-    content = fs.readFileSync(logPath, "utf-8");
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "EPERM" || code === "EACCES") {
-      if (expectedTotalRecords && expectedTotalRecords > 0) {
-        return {
-          valid: false,
-          totalEntries: 0,
-          code: "MISSING_LOG",
-          errorReason: `Audit log file is missing; expected ${expectedTotalRecords} records`,
-        };
-      }
-      return { valid: true, totalEntries: 0, code: "SUCCESS" };
+    content = fs.readFileSync(fd, "utf-8");
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
     }
-    throw err;
   }
 
   const lines = content.split("\n").filter((l) => l.trim().length > 0);

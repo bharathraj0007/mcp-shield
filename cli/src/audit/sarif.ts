@@ -83,7 +83,7 @@ function mapSeverityToScore(severity: RuleSeverity): string {
 
 export function generateSarifReport(
   scanResult: ScanResult,
-  version: string = "0.2.0"
+  version: string = "1.0.0"
 ): SarifDocument {
   const ruleMap = new Map<string, SarifRule>();
 

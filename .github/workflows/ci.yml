@@ -58,7 +58,7 @@ jobs:
 
       - name: Run dependency security audit
         working-directory: cli
-        run: npm audit --audit-level=high
+        run: npm audit --omit=dev --audit-level=high
         continue-on-error: true
 
       - name: Verify package tarball (dry run)
@@ -70,7 +70,8 @@ jobs:
         shell: bash
         run: |
           npm pack
-          npm install -g ./bharathraj_07-mcp-shield-0.2.0.tgz
+          TARBALL=$(ls bharathraj_07-mcp-shield-*.tgz | head -n 1)
+          npm install -g "./$TARBALL"
           mcp-shield --version
           mcp-shield --help
 

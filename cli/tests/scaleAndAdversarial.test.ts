@@ -2,14 +2,11 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import * as crypto from "node:crypto";
 import {
   appendAuditEntry,
   verifyAuditLog,
   generateAuditKeyPair,
   createAuditCheckpoint,
-  signCheckpointPayload,
-  verifyCheckpointPayload,
 } from "../src/audit/logWriter.js";
 import { parseConfigFile } from "../src/scanner/discover.js";
 import { validateJsonRpcPayload, scanJsonStructure } from "../src/proxy/jsonValidator.js";

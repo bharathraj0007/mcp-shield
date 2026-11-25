@@ -13,13 +13,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as crypto from "node:crypto";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const cliRoot = path.resolve(__dirname, "..");
-const repoRoot = path.resolve(cliRoot, "..");
 
 console.log("Generating mcp-shield release artifacts (offline)...");
 
@@ -84,43 +83,71 @@ const sbomPath = path.join(cliRoot, "sbom.cdx.json");
 fs.writeFileSync(sbomPath, JSON.stringify(sbom, null, 2) + "\n", "utf-8");
 console.log(`✓ Generated CycloneDX 1.5 SBOM: ${path.basename(sbomPath)} (${components.length} components)`);
 
-// 3. Package npm tarball via npm pack
+// 3. Package npm tarball via npm pack using secure temp cache and execFileSync
 console.log("Packaging npm tarball via npm pack...");
-const cacheDir = path.join(os.tmpdir(), "mcp-shield-npm-cache");
-const packOutput = execSync(`npm pack --cache ${cacheDir}`, { cwd: cliRoot, encoding: "utf-8" });
+const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-shield-npm-cache-"));
 let tarballFilename = "";
-const lines = packOutput.trim().split("\n");
-for (const line of lines) {
-  const trimmed = line.trim();
-  if (trimmed.endsWith(".tgz")) {
-    tarballFilename = trimmed;
-  }
-}
 
-if (!tarballFilename || !fs.existsSync(path.join(cliRoot, tarballFilename))) {
-  // Find latest .tgz in cliRoot
-  const files = fs.readdirSync(cliRoot).filter((f) => f.endsWith(".tgz"));
-  if (files.length > 0) {
-    tarballFilename = files[files.length - 1];
-  }
-}
+try {
+  const packOutput =
+    process.platform === "win32"
+      ? execFileSync(
+          process.env.ComSpec || "cmd.exe",
+          ["/d", "/s", "/c", "npm", "pack", "--cache", cacheDir],
+          { cwd: cliRoot, encoding: "utf-8", shell: false }
+        )
+      : execFileSync("npm", ["pack", "--cache", cacheDir], {
+          cwd: cliRoot,
+          encoding: "utf-8",
+          shell: false,
+        });
 
-if (!tarballFilename) {
-  throw new Error("Failed to produce or identify npm pack tarball");
+  const lines = packOutput.trim().split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.endsWith(".tgz")) {
+      tarballFilename = trimmed;
+    }
+  }
+
+  if (!tarballFilename) {
+    const files = fs.readdirSync(cliRoot).filter((f) => f.endsWith(".tgz"));
+    if (files.length > 0) {
+      tarballFilename = files[files.length - 1] || "";
+    }
+  }
+
+  if (
+    !tarballFilename ||
+    path.basename(tarballFilename) !== tarballFilename ||
+    !tarballFilename.endsWith(".tgz")
+  ) {
+    throw new Error(`Failed to produce or validate npm pack tarball: ${tarballFilename}`);
+  }
+} finally {
+  try {
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  } catch {}
 }
 
 console.log(`✓ Packaged release tarball: ${tarballFilename}`);
 
-// 4. Compute SHA-256 digests for release artifacts
+// 4. Compute SHA-256 digests for release artifacts using atomic file reads
 const artifactsToDigest = [tarballFilename, "sbom.cdx.json"];
 const sumLines = [];
 
 for (const artifact of artifactsToDigest) {
+  if (path.basename(artifact) !== artifact) {
+    throw new Error(`Invalid artifact path: ${artifact}`);
+  }
   const artifactPath = path.join(cliRoot, artifact);
-  if (fs.existsSync(artifactPath)) {
+  try {
     const fileBytes = fs.readFileSync(artifactPath);
     const hash = crypto.createHash("sha256").update(fileBytes).digest("hex");
     sumLines.push(`${hash}  ${artifact}`);
+  } catch (readErr) {
+    const errMsg = readErr instanceof Error ? readErr.message : String(readErr);
+    throw new Error(`Failed to read artifact for digest calculation: ${errMsg}`);
   }
 }
 
