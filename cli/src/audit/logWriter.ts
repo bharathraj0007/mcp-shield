@@ -16,6 +16,36 @@ export function computeSha256(content: string): string {
 }
 
 /**
+ * Safe text file reader using single file descriptor with O_NOFOLLOW
+ * to eliminate check-then-act TOCTOU race conditions.
+ */
+export function safeReadTextFile(filePath: string): string {
+  const noFollowFlag = fs.constants.O_NOFOLLOW ?? 0;
+  let fd: number;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollowFlag);
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EINVAL" && noFollowFlag !== 0) {
+      fd = fs.openSync(filePath, fs.constants.O_RDONLY);
+    } else {
+      throw err;
+    }
+  }
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) {
+      throw new Error(`Target is not a regular file: ${filePath}`);
+    }
+    return fs.readFileSync(fd, "utf-8");
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {}
+  }
+}
+
+/**
  * Deterministic canonical JSON serialization with sorted keys.
  */
 export function canonicalJsonStringify(obj: unknown): string {
@@ -87,15 +117,54 @@ export function generateAuditKeyPair(outDir?: string): {
   const privateKeyPath = path.join(targetDir, "audit-signing.key");
   const publicKeyPath = path.join(targetDir, "audit-signing.pub");
 
-  fs.writeFileSync(privateKeyPath, privateKey, {
-    mode: process.platform === "win32" ? undefined : 0o600,
-    encoding: "utf-8",
-  });
+  // Write private key with atomic 0o600 creation
+  let privFd: number;
+  try {
+    privFd = fs.openSync(
+      privateKeyPath,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+      0o600
+    );
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      try {
+        fs.unlinkSync(privateKeyPath);
+      } catch {}
+      privFd = fs.openSync(
+        privateKeyPath,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+        0o600
+      );
+    } else {
+      throw err;
+    }
+  }
+  try {
+    fs.writeFileSync(privFd, privateKey, "utf-8");
+  } finally {
+    try {
+      fs.closeSync(privFd);
+    } catch {}
+  }
 
-  fs.writeFileSync(publicKeyPath, publicKey, {
-    mode: process.platform === "win32" ? undefined : 0o644,
-    encoding: "utf-8",
-  });
+  // Write public key with atomic 0o644 creation
+  let pubFd: number;
+  try {
+    pubFd = fs.openSync(
+      publicKeyPath,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC,
+      0o644
+    );
+  } catch (err: unknown) {
+    throw err;
+  }
+  try {
+    fs.writeFileSync(pubFd, publicKey, "utf-8");
+  } finally {
+    try {
+      fs.closeSync(pubFd);
+    } catch {}
+  }
 
   return { privateKeyPath, publicKeyPath, keyId };
 }
@@ -149,13 +218,11 @@ export function createAuditCheckpoint(options?: {
       process.env.MCP_SHIELD_AUDIT_PRIVATE_KEY ||
       path.join(process.cwd(), "audit-signing.key");
 
-    let content: string;
     try {
-      content = fs.readFileSync(path.resolve(keyPath), "utf-8");
+      privateKeyPem = safeReadTextFile(path.resolve(keyPath));
     } catch {
       throw new Error(`Audit signing private key not found at: ${keyPath}`);
     }
-    privateKeyPem = content;
   }
 
   // Derive public key and deterministic keyId
@@ -164,14 +231,14 @@ export function createAuditCheckpoint(options?: {
   const pubKeyPem = pubKeyObj.export({ type: "spki", format: "pem" }).toString();
   const keyId = crypto.createHash("sha256").update(pubKeyPem).digest("hex").slice(0, 16);
 
-  // Read current log state
+  // Read current log state using safeReadTextFile
   let prevHash = GENESIS_PREV_HASH;
   let seq = 1;
   let eventCount = 0;
 
   try {
-    const lines = fs
-      .readFileSync(logPath, "utf-8")
+    const rawContent = safeReadTextFile(logPath);
+    const lines = rawContent
       .trim()
       .split("\n")
       .filter(Boolean);
@@ -237,13 +304,6 @@ export function createAuditCheckpoint(options?: {
     mode: process.platform === "win32" ? undefined : 0o600,
     encoding: "utf-8",
   });
-
-  if (process.platform !== "win32") {
-    try {
-      fs.chmodSync(dir, 0o700);
-      fs.chmodSync(logPath, 0o600);
-    } catch {}
-  }
 
   return checkpointEntry;
 }
@@ -388,14 +448,6 @@ export function appendAuditEntry(
     encoding: "utf-8",
   });
 
-  // Enforce POSIX permissions on directory and file
-  if (process.platform !== "win32") {
-    try {
-      fs.chmodSync(dir, 0o700);
-      fs.chmodSync(logPath, 0o600);
-    } catch {}
-  }
-
   return fullEntry;
 }
 
@@ -530,7 +582,7 @@ export function verifyAuditLog(
       publicKeyPem = publicKeyPathOrContent;
     } else {
       try {
-        publicKeyPem = fs.readFileSync(path.resolve(publicKeyPathOrContent), "utf-8");
+        publicKeyPem = safeReadTextFile(path.resolve(publicKeyPathOrContent));
       } catch {
         return {
           valid: false,
@@ -546,7 +598,7 @@ export function verifyAuditLog(
       publicKeyPem = envKey;
     } else {
       try {
-        publicKeyPem = fs.readFileSync(path.resolve(envKey), "utf-8");
+        publicKeyPem = safeReadTextFile(path.resolve(envKey));
       } catch {}
     }
   }
@@ -733,7 +785,7 @@ export function getAuditTail(n: number = 20, customLogPath?: string): AuditLogEn
   const logPath = customLogPath || getDefaultAuditLogPath();
   let content: string;
   try {
-    content = fs.readFileSync(logPath, "utf-8");
+    content = safeReadTextFile(logPath);
   } catch {
     return [];
   }
