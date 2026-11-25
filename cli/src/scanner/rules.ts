@@ -178,9 +178,18 @@ const SENSITIVE_KEY_NAME_REGEX =
 function matchesExcludePattern(filePath: string, patterns: readonly string[]): boolean {
   const normalized = filePath.replace(/\\/g, "/");
   for (const pat of patterns) {
-    const clean = pat.replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*");
-    const reg = new RegExp(clean, "i");
-    if (reg.test(normalized)) return true;
+    try {
+      const normalizedPat = pat.replace(/\\/g, "/");
+      const escaped = normalizedPat.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+      const clean = escaped
+        .replace(/\*\*/g, ".*")
+        .replace(/\*(?!\*)/g, "[^/]*")
+        .replace(/\?/g, "[^/]");
+      const reg = new RegExp(clean, "i");
+      if (reg.test(normalized)) return true;
+    } catch {
+      if (normalized.toLowerCase().includes(pat.toLowerCase())) return true;
+    }
   }
   return false;
 }

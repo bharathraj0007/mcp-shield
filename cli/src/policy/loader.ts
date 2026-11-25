@@ -254,14 +254,15 @@ export function validatePolicyFile(filePath: string): {
   policy?: PolicyConfig;
 } {
   const resolved = path.resolve(expandHome(filePath));
-  if (!fs.existsSync(resolved)) {
-    return { valid: false, errors: [`Policy file not found: ${filePath}`] };
-  }
 
   let content: string;
   try {
     content = fs.readFileSync(resolved, "utf-8");
-  } catch (err) {
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      return { valid: false, errors: [`Policy file not found: ${filePath}`] };
+    }
     return {
       valid: false,
       errors: [`Failed to read policy file: ${(err as Error).message}`],
@@ -301,21 +302,23 @@ export function loadPolicy(
 
   // 1. Check Global Policy: ~/.mcp-shield/policy.yaml
   const globalPath = path.join(os.homedir(), ".mcp-shield", "policy.yaml");
-  if (fs.existsSync(globalPath)) {
-    const res = validatePolicyFile(globalPath);
-    if (res.valid && res.policy) {
-      effectivePolicy = mergePolicyConfigs(effectivePolicy, res.policy);
-    }
+  const resGlobal = validatePolicyFile(globalPath);
+  if (resGlobal.valid && resGlobal.policy) {
+    effectivePolicy = mergePolicyConfigs(effectivePolicy, resGlobal.policy);
   }
 
   // 2. Check Workspace Policy: ./policy.yaml or ./.mcp-shield/policy.yaml
   let workspacePath: string | undefined;
   const local1 = path.resolve(process.cwd(), "policy.yaml");
   const local2 = path.resolve(process.cwd(), ".mcp-shield", "policy.yaml");
-  if (fs.existsSync(local1)) {
+  const resLocal1 = validatePolicyFile(local1);
+  if (resLocal1.valid && resLocal1.policy) {
     workspacePath = local1;
-  } else if (fs.existsSync(local2)) {
-    workspacePath = local2;
+  } else {
+    const resLocal2 = validatePolicyFile(local2);
+    if (resLocal2.valid && resLocal2.policy) {
+      workspacePath = local2;
+    }
   }
 
   // 3. Explicit CLI/Target Path

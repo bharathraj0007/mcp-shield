@@ -88,13 +88,11 @@ export class RugPullManager {
 
   private loadBaseline(): void {
     try {
-      if (fs.existsSync(this.baselinePath)) {
-        const content = fs.readFileSync(this.baselinePath, "utf-8");
-        const parsed = JSON.parse(content) as RugPullBaselineFile;
-        if (parsed?.tools && typeof parsed.tools === "object") {
-          for (const [name, snapshot] of Object.entries(parsed.tools)) {
-            this.activeTools.set(name, snapshot);
-          }
+      const content = fs.readFileSync(this.baselinePath, "utf-8");
+      const parsed = JSON.parse(content) as RugPullBaselineFile;
+      if (parsed?.tools && typeof parsed.tools === "object") {
+        for (const [name, snapshot] of Object.entries(parsed.tools)) {
+          this.activeTools.set(name, snapshot);
         }
       }
     } catch {
@@ -107,9 +105,7 @@ export class RugPullManager {
 
     try {
       const dir = path.dirname(this.baselinePath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true, mode: process.platform === "win32" ? undefined : 0o700 });
-      }
+      fs.mkdirSync(dir, { recursive: true, mode: process.platform === "win32" ? undefined : 0o700 });
 
       const toolsObj: Record<string, StoredToolSnapshot> = {};
       for (const [name, snapshot] of this.activeTools.entries()) {
@@ -122,7 +118,7 @@ export class RugPullManager {
         tools: toolsObj,
       };
 
-      const tmpPath = `${this.baselinePath}.tmp.${Date.now()}`;
+      const tmpPath = `${this.baselinePath}.tmp.${crypto.randomBytes(16).toString("hex")}`;
       fs.writeFileSync(tmpPath, JSON.stringify(fileData, null, 2) + "\n", "utf-8");
       fs.renameSync(tmpPath, this.baselinePath);
     } catch {

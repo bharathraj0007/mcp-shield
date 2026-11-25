@@ -177,28 +177,21 @@ export function resolveCanonicalPath(rawPath: string): string {
 
   let resolved = absolute;
 
-  if (fs.existsSync(absolute)) {
-    try {
-      resolved = fs.realpathSync(absolute);
-    } catch {
-      resolved = absolute;
-    }
-  } else {
-    let current = absolute;
-    const childSegments: string[] = [];
+  try {
+    resolved = fs.realpathSync(absolute);
+  } catch {
+    let current = path.dirname(absolute);
+    const childSegments: string[] = [path.basename(absolute)];
 
     while (current && current !== path.dirname(current)) {
-      if (fs.existsSync(current)) {
-        try {
-          const realParent = fs.realpathSync(current);
-          resolved = path.join(realParent, ...[...childSegments].reverse());
-        } catch {
-          resolved = absolute;
-        }
+      try {
+        const realParent = fs.realpathSync(current);
+        resolved = path.join(realParent, ...[...childSegments].reverse());
         break;
+      } catch {
+        childSegments.push(path.basename(current));
+        current = path.dirname(current);
       }
-      childSegments.push(path.basename(current));
-      current = path.dirname(current);
     }
   }
 
@@ -589,17 +582,39 @@ export function evaluateRequest(
 
     if (policy?.denyPaths) {
       for (const denyPattern of policy.denyPaths) {
-        const cleanPattern = denyPattern.replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*");
-        const reg = new RegExp(cleanPattern, "i");
-        if (reg.test(trimmed) || reg.test(decoded) || reg.test(canonical)) {
-          return {
-            action: "BLOCK",
-            ruleId: "MS-002",
-            owaspId: "MCP02:2025",
-            reason: `Blocked by mcp-shield policy: Path matches denyPaths rule "${denyPattern}"`,
-            redactedTarget: redactTarget(canonical),
-            errorCode: JsonRpcErrorCode.POLICY_BLOCK,
-          };
+        try {
+          const normalizedPat = denyPattern.replace(/\\/g, "/");
+          const escaped = normalizedPat.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+          const cleanPattern = escaped
+            .replace(/\*\*/g, ".*")
+            .replace(/\*(?!\*)/g, "[^/]*")
+            .replace(/\?/g, "[^/]");
+          const reg = new RegExp(cleanPattern, "i");
+          if (reg.test(trimmed) || reg.test(decoded) || reg.test(canonical)) {
+            return {
+              action: "BLOCK",
+              ruleId: "MS-002",
+              owaspId: "MCP02:2025",
+              reason: `Blocked by mcp-shield policy: Path matches denyPaths rule "${denyPattern}"`,
+              redactedTarget: redactTarget(canonical),
+              errorCode: JsonRpcErrorCode.POLICY_BLOCK,
+            };
+          }
+        } catch {
+          if (
+            trimmed.toLowerCase().includes(denyPattern.toLowerCase()) ||
+            decoded.toLowerCase().includes(denyPattern.toLowerCase()) ||
+            canonical.toLowerCase().includes(denyPattern.toLowerCase())
+          ) {
+            return {
+              action: "BLOCK",
+              ruleId: "MS-002",
+              owaspId: "MCP02:2025",
+              reason: `Blocked by mcp-shield policy: Path matches denyPaths rule "${denyPattern}"`,
+              redactedTarget: redactTarget(canonical),
+              errorCode: JsonRpcErrorCode.POLICY_BLOCK,
+            };
+          }
         }
       }
     }

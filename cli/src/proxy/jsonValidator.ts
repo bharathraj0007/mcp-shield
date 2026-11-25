@@ -104,7 +104,7 @@ export function scanJsonStructure(
  * Extract `id` from raw JSON snippet safely for error responses.
  */
 export function extractIdSafely(rawSnippet: string): string | number | null {
-  const match = /"id"\s*:\s*(-?\d+|"[^"\\]*(?:\\.[^"\\]*)*"|null)/.exec(rawSnippet);
+  const match = /"id"\s*:\s*(-?\d+|"(?:\\.|[^"\\])*"|null)/.exec(rawSnippet);
   if (match && match[1]) {
     try {
       return JSON.parse(match[1]) as string | number | null;

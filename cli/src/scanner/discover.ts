@@ -487,35 +487,37 @@ export function discoverConfigs(customPath?: string): {
 
   if (customPath) {
     const resolved = path.resolve(expandHome(customPath));
+    const directParsed = parseConfigFile(resolved, "custom");
+    if (directParsed.length > 0) {
+      scannedFiles.add(resolved);
+      servers.push(...directParsed);
+      return { servers, scannedFiles: Array.from(scannedFiles) };
+    }
+
     try {
-      const stat = fs.statSync(resolved);
-      if (stat.isFile()) {
-        scannedFiles.add(resolved);
-        servers.push(...parseConfigFile(resolved, "custom"));
-      } else if (stat.isDirectory()) {
-        const candidateNames = [
-          "mcp.json",
-          "mcp_config.json",
-          ".mcp.json",
-          ".cursor/mcp.json",
-          ".vscode/mcp.json",
-          ".agents/mcp_config.json",
-          "cline_mcp_settings.json",
-          ".cline/mcp_settings.json",
-          "mcp.yaml",
-          "mcp.yml",
-          "mcp.toml",
-        ];
-        for (const rel of candidateNames) {
-          const target = path.join(resolved, rel);
-          try {
-            const targetStat = fs.statSync(target);
-            if (targetStat.isFile() && !isBackupFile(target)) {
-              scannedFiles.add(target);
-              servers.push(...parseConfigFile(target, "custom"));
-            }
-          } catch {}
+      const candidateNames = [
+        "mcp.json",
+        "mcp_config.json",
+        ".mcp.json",
+        ".cursor/mcp.json",
+        ".vscode/mcp.json",
+        ".agents/mcp_config.json",
+        "cline_mcp_settings.json",
+        ".cline/mcp_settings.json",
+        "mcp.yaml",
+        "mcp.yml",
+        "mcp.toml",
+      ];
+      for (const rel of candidateNames) {
+        const target = path.join(resolved, rel);
+        if (!isBackupFile(target)) {
+          const parsed = parseConfigFile(target, "custom");
+          if (parsed.length > 0) {
+            scannedFiles.add(target);
+            servers.push(...parsed);
+          }
         }
+      }
         if (scannedFiles.size === 0) {
           try {
             const entries = fs.readdirSync(resolved, { withFileTypes: true });
@@ -536,23 +538,20 @@ export function discoverConfigs(customPath?: string): {
             }
           } catch {}
         }
-      }
-    } catch {}
-    return { servers, scannedFiles: Array.from(scannedFiles) };
-  }
+      } catch {}
+      return { servers, scannedFiles: Array.from(scannedFiles) };
+    }
 
   // Scan known standard locations
   for (const loc of getKnownLocations()) {
     try {
       const p = loc.getPath();
       if (!isBackupFile(p)) {
-        try {
-          const stat = fs.statSync(p);
-          if (stat.isFile()) {
-            scannedFiles.add(p);
-            servers.push(...parseConfigFile(p, loc.client));
-          }
-        } catch {}
+        const parsed = parseConfigFile(p, loc.client);
+        if (parsed.length > 0) {
+          scannedFiles.add(p);
+          servers.push(...parsed);
+        }
       }
     } catch {
       // Skip inaccessible locations cleanly

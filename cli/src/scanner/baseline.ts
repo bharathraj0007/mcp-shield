@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as crypto from "node:crypto";
 import type { BaselineFile, BaselineFinding, ScanFinding } from "../types/index.js";
 
 /**
@@ -123,11 +124,9 @@ export function updateBaseline(
   };
 
   const dir = path.dirname(resolvedPath);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+  fs.mkdirSync(dir, { recursive: true });
 
-  const tempPath = `${resolvedPath}.tmp.${Date.now()}`;
+  const tempPath = `${resolvedPath}.tmp.${crypto.randomBytes(16).toString("hex")}`;
   fs.writeFileSync(tempPath, JSON.stringify(baselineData, null, 2) + "\n", "utf-8");
   fs.renameSync(tempPath, resolvedPath);
 }

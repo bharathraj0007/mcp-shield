@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as crypto from "node:crypto";
 import { parseTree, findNodeAtLocation, modify, applyEdits } from "jsonc-parser";
 import pc from "picocolors";
 import { maskSecret, isSafePlaceholder } from "../scanner/rules.js";
@@ -122,17 +123,6 @@ function formatEnvValue(val: string): string {
 function readTextFileSecurely(filePath: string, symlinkErrorMessage?: string): string {
   const resolved = path.resolve(filePath);
 
-  // On platforms lacking O_NOFOLLOW (e.g. Windows), inspect lstat before opening
-  if (!fs.constants.O_NOFOLLOW) {
-    try {
-      if (fs.lstatSync(resolved).isSymbolicLink()) {
-        throw new Error(symlinkErrorMessage || `Refusing to access symbolic link: ${resolved}`);
-      }
-    } catch (err: unknown) {
-      if ((err as Error).message.includes("symbolic link")) throw err;
-    }
-  }
-
   const noFollowFlag = fs.constants.O_NOFOLLOW ?? 0;
   let fd: number;
   try {
@@ -167,7 +157,7 @@ function writeTextFileAtomically(targetPath: string, content: string, mode: numb
   const targetDir = path.dirname(resolved);
   const tmpPath = path.join(
     targetDir,
-    `.${path.basename(resolved)}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`
+    `.${path.basename(resolved)}.tmp.${crypto.randomBytes(16).toString("hex")}`
   );
 
   const fd = fs.openSync(
@@ -516,11 +506,11 @@ export function executeSafeFix(
   // 4. Atomic file write via temp files
   const tmpConfig = path.join(
     targetDir,
-    `.${path.basename(resolvedPath)}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`
+    `.${path.basename(resolvedPath)}.tmp.${crypto.randomBytes(16).toString("hex")}`
   );
   const tmpEnv = path.join(
     targetDir,
-    `.${path.basename(envFile)}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`
+    `.${path.basename(envFile)}.tmp.${crypto.randomBytes(16).toString("hex")}`
   );
 
   try {
@@ -555,12 +545,6 @@ export function executeSafeFix(
     // Atomic renames
     fs.renameSync(tmpConfig, resolvedPath);
     fs.renameSync(tmpEnv, envFile);
-
-    if (process.platform !== "win32") {
-      try {
-        fs.chmodSync(envFile, 0o600);
-      } catch {}
-    }
   } catch (err) {
     // Rollback on partial failure
     try {

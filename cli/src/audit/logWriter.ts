@@ -335,19 +335,11 @@ export function appendAuditEntry(
   const logPath = customLogPath || getDefaultAuditLogPath();
   const dir = path.dirname(logPath);
 
-  // 1. Check directory symlink & create directory safely
+  // 1. Create directory safely
   fs.mkdirSync(dir, {
     recursive: true,
     mode: process.platform === "win32" ? undefined : 0o700,
   });
-  try {
-    const dStat = fs.lstatSync(dir);
-    if (dStat.isSymbolicLink()) {
-      throw new Error("SYMLINK_DETECTED: Audit directory cannot be a symbolic link");
-    }
-  } catch (err) {
-    if ((err as Error).message.startsWith("SYMLINK_DETECTED")) throw err;
-  }
 
   // 2. Open log file safely via file descriptor to eliminate TOCTOU races
   let prevHash = GENESIS_PREV_HASH;
@@ -466,22 +458,6 @@ export function verifyAuditLog(
   publicKeyPathOrContent?: string
 ): AuditVerifyResult {
   const logPath = customLogPath || getDefaultAuditLogPath();
-  const dir = path.dirname(logPath);
-
-  // Check symlinks
-  try {
-    if (fs.lstatSync(dir).isSymbolicLink()) {
-      return {
-        valid: false,
-        totalEntries: 0,
-        code: "SYMLINK_DETECTED",
-        errorReason: "Audit directory is a symbolic link",
-      };
-    }
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code !== "ENOENT" && code !== "EPERM" && code !== "EACCES") throw err;
-  }
 
   const noFollowFlag = fs.constants.O_NOFOLLOW ?? 0;
   let fd: number | undefined;
